@@ -17,6 +17,8 @@ export const instanceSettingsSchema = z.object({
   displayName: displayName.optional(),
   configDir: configDir.optional(),
   tools: z.boolean().optional(),
+  /** null goes back to the server's default wait. */
+  replyWaitMinutes: z.number().int().min(1).max(60).nullable().optional(),
 }).strict().refine((value) => Object.keys(value).length > 0, "No settings supplied");
 
 function rawConfig(entry: InstanceConfig): Record<string, unknown> {
@@ -43,7 +45,7 @@ export function configuredAccountDirectory(entry: InstanceConfig): string {
 
 function directoryIdentity(path: string): string {
   let canonical = path;
-  try { canonical = realpathSync.native(path); } catch { /* Login may create it later. */ }
+  try { canonical = realpathSync.native(path); } catch {}
   return process.platform === "win32" ? canonical.toLowerCase() : canonical;
 }
 
@@ -78,8 +80,7 @@ export function newClaudeAccount(cfg: AppConfig, body: z.infer<typeof createClau
   return { instanceId, instances };
 }
 
-/** Copyable commands are quoted as data, including wrapper arguments. The
- * subshell/block restores the caller's environment after Claude finishes. */
+/** Copyable commands quote everything as data, wrapper arguments included; the subshell restores the caller's environment. */
 export function claudeSignInCommand(cli: string, directory: string, platform: NodeJS.Platform = process.platform): string {
   const resolved = resolveCli(cli, ["auth", "login"]);
   if (platform === "win32") {

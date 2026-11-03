@@ -2,13 +2,15 @@
  * Durable payload carried by a profile confirmation card (propose_profile).
  *
  * The fields a bot may propose for itself (`cwd` is the working folder its
- * tools run in; "" means its private workspace). `before` is the snapshot the
- * user was shown; `expectedRevision` is a hash of the target's whole profile
- * at proposal time so a confirmation fails closed if anything moved.
+ * tools run in; "" means its private workspace; `notifications` and
+ * `speakReplies` are the alert and voice toggles). `before` is the snapshot
+ * the user was shown; `expectedRevision` is a hash of the target's whole
+ * profile at proposal time so a confirmation fails closed if anything moved.
  */
-export const PROFILE_REQUEST_FIELDS = ["name", "title", "description", "soul", "cwd"] as const;
+export const PROFILE_REQUEST_FIELDS = ["name", "title", "description", "soul", "cwd", "notifications", "speakReplies"] as const;
 export type ProfileRequestField = (typeof PROFILE_REQUEST_FIELDS)[number];
-export type ProfileRequestChanges = Partial<Record<ProfileRequestField, string>>;
+export type ProfileRequestChanges = Partial<Record<Exclude<ProfileRequestField, "notifications" | "speakReplies">, string>> &
+  Partial<Record<"notifications" | "speakReplies", boolean>>;
 
 export interface ProfileRequestCardData {
   version: 1;
@@ -25,4 +27,9 @@ export interface ProfileRequestCardData {
   before: ProfileRequestChanges;
   expectedRevision: string;
   appliedAt?: number;
+  /** Written when the change applied without a person: the profile's
+   * revision right after it, so Undo refuses once anything moved. Absent
+   * when the before values could not be kept exactly (credential-shaped
+   * text is scrubbed from cards), which means no Undo. */
+  undo?: { appliedRevision: string };
 }

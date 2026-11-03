@@ -54,6 +54,12 @@ unique sections, checking that existing bots, section Chiefs, rooms and the
 original conversation remain unchanged after each import.
 Keep that JSON output and the printed persistent server log as evidence.
 
+A bot switched to never use the helper model (`helperModel: false`, see
+[the memory guide](../memory.md)) keeps that switch through backup and import:
+the file holds its notes and chats. Only "never" is written and only "never"
+is applied: a file that says a bot may use the helper imports like one that
+says nothing, so a file cannot put a bot on the helper.
+
 `server/team-backup.test.ts` additionally covers all-task/branch restoration,
 multi-section Chiefs, room-goal routines, repeat imports, restart persistence,
 malformed reference graphs, permission injection and rollback on failure.
@@ -76,6 +82,10 @@ The output includes the fixture log path and a sidebar screenshot saved at
 `.omb-scratch/verify-evidence/template-import-sections.png`.
 
 ## Explicit skills in setup packages
+
+This section is the original whole-installation Markdown export. Sharing one
+team with everything but its chat history (all its skills by default) is
+**Share team…**, covered in [team-sharing.md](team-sharing.md).
 
 The existing package export API accepts an explicit list of imported skill names:
 `POST /api/teams/export` with

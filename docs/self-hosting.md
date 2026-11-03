@@ -6,8 +6,9 @@ The npm CLI supports a managed public tunnel, Tailscale, or your own proxy.
 
 > **Security first:** by default a self-hosted server trusts loopback as its
 > owner — any process that can reach `127.0.0.1:8799` has full control,
-> including the shell your bots can use. **Never expose that port directly
-> and never bind it to a public interface.** Reach it through an SSH tunnel, a
+> including the shell your bots can use. A browser is the exception: even on
+> this machine it signs in once (see [A browser signs in](#a-browser-signs-in)).
+> **Never expose that port directly and never bind it to a public interface.** Reach it through an SSH tunnel, a
 > private network you trust, or an authenticated remote path below. Requests
 > through the managed tunnel or a correctly configured proxy require a paired
 > session. If several people use one server, read
@@ -35,6 +36,9 @@ Runs fully on a server:
   (`npx openmausbot browser install`, or nothing to do in the Docker image,
   which ships it): each bot gets its own isolated, persistent session.
   Watching it live from the app is the next step (docs/plans/browser-engine.md).
+  It reaches the public internet and the dev servers a bot starts itself,
+  not this server's network or other services unless `browserEngine.egress.allow`
+  lists them ([what a bot's browser can reach](browser-packaging.md#what-a-bots-browser-can-reach)).
 
 Desktop-only for now (needs the Mac/Linux app):
 
@@ -91,8 +95,11 @@ is present. Three ways to make the server reachable from elsewhere:
   that address. The first run downloads `cloudflared` (pinned version and
   digest) into the data dir. Only traffic through the tunnel reaches the
   server, and it still has to pair: the tunnel lands on a separate listener
-  the server treats as "through a proxy", never as the owner. `npx openmausbot
-  logout` releases the address. The account credentials live in
+  the server treats as "through a proxy", never as the owner. That listener
+  also gzips JSON replies of 1 KB or more when the client accepts gzip, since
+  the hop to Cloudflare runs on this machine's upload uncompressed; the
+  loopback port never compresses. `npx openmausbot logout` releases the
+  address. The account credentials live in
   `~/.openmausbot/tunnel-account.json` (mode 0600).
   Starting it from a fleet or a container, where nobody can type an emailed
   code? Set `OMB_INSTALLATION_CREDENTIAL` to the installation credential the
@@ -125,7 +132,7 @@ implicitly download a new release.
 
 ## Connect ChatGPT from the browser
 
-An owner-paired browser can connect an installed Codex CLI without opening a
+A browser paired with Full access can connect an installed Codex CLI without opening a
 terminal: **Settings → Engines → Codex → Connect ChatGPT**. OMB starts
 `codex login --device-auth` on the server and shows a one-time code. Choose
 **Open ChatGPT sign-in**, enter the code on OpenAI's page, and complete sign-in
@@ -152,7 +159,7 @@ pulled away; finish or cancel it first.
 ## Connect a custom domain in Settings
 
 For a self-hosted server, open **Settings → Remote access → Connect your
-domain** from an owner-paired browser. This is an address-setting and verification
+domain** from a browser paired with Full access. This is an address-setting and verification
 flow, not a DNS or hosting service. Enter the domain to see a compact DNS record
 with copy buttons for **Type**, **Name / Host**, and **Value / IP**. The full
 hostname is shown; providers that already append the DNS zone need only the
@@ -248,6 +255,15 @@ Upgrade with `docker compose pull omb && docker compose up -d` (or
 `git pull && docker compose up -d --build`). State (chats, routines,
 engine logins, paired sessions) is on the `data` volume; back that up.
 
+The published image installs the current Chrome for Testing whenever a new
+Stable ships. A build from source keeps the Chrome (and any `ENGINES`) it
+installed first, because those layers sit beneath the app and stay cached
+across code changes. To pick up the current ones, rebuild with a new tag:
+
+```sh
+docker compose build --build-arg CHROME_CACHE_TAG=$(date +%F) omb && docker compose up -d
+```
+
 ## From source
 
 Requirements: Node 24+, pnpm, and at least one agent CLI installed and
@@ -311,6 +327,20 @@ that makes one read-only request to the provider from the server.
   always uses a personal ChatGPT login.
 - **xAI API key**: the Grok API engine and xAI image generation.
 
+A saved key goes only to its own engine and only to the workspace's endpoint:
+an engine instance in `config.json` with its own base URL or its own key (a
+router or proxy) never receives it.
+
+**OpenCode is the exception to "the server's own environment is ignored".**
+Like `opencode` in a terminal, it reads provider keys from its environment
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+`KIMI_API_KEY`, `MOONSHOT_API_KEY`, `MINIMAX_API_KEY`) and offers those
+providers' models, billed to that key. It does so only where the server's
+environment is one person's own: never on MausBot Cloud, a hosted team
+workspace, an organisation-managed desktop, or a server whose sign-in list
+lets other people in (users, more than one admin, or a whole domain).
+Providers added with `opencode auth login` work everywhere.
+
 ## Many client workspaces on one server
 
 `openmausbot fleet` runs one workspace per client on a single Linux server,
@@ -347,8 +377,8 @@ openmausbot fleet delete acme --yes # add --keep-data to keep the home folder
 Give `init` `--operator USER` (the Unix user your own workspace runs as; the
 user behind `sudo` by default) and it also installs the **fleet agent**: a
 root service on a Unix socket only that user may open. Your workspace then
-shows **Settings → Workspaces** (with the enterprise `admin` feature): create
-a workspace, add or remove who may sign in, suspend, resume, delete, upgrade
+shows **Settings → Installations** (with the enterprise `admin` feature): create
+an installation, add or remove who may sign in, suspend, resume, delete, upgrade
 all, and see each one's spend this month. Every action goes through the
 agent's audit log at `/var/log/openmausbot/fleet.jsonl`.
 
@@ -396,8 +426,8 @@ gets a session cookie (30 days, renewed on use up to 180 days from pairing, revo
 listed and revoked at `GET`/`DELETE /api/auth/sessions` for now; a Settings
 screen follows.
 
-From the **desktop app**, use the workspace dropdown above Search → **Connect
-hosted workspace…**, or **Settings → Connected workspaces**. Enter the server's
+From the **desktop app**, use the server dropdown above Search → **Connect
+to a server…**, or **Settings → Servers**. Enter the server's
 HTTPS address or full pairing link, with an optional name. Custom domains and
 Cloudflare tunnel addresses work; Tailscale is not required. Generate a fresh
 link for each device: `npx openmausbot pair --label "My desktop"` creates an
@@ -415,14 +445,52 @@ the six-digit code from another desktop app, not a self-hosted server's
 Server menu to switch back until the server is updated.
 
 After pairing, **Share this computer?** offers **Choose access** or **Not now**.
-Nothing is shared automatically. In **Settings → Connected workspaces → Computer
+Nothing is shared automatically, unless you make the server your bots' home
+(below). In **Settings → Servers → Computer
 access**, choose read-only folders and optionally allow edits. Unrestricted
 terminal and screen/app control are separate opt-ins, confirmed in a native
 dialog. They can access information outside the selected folders. Share only
 with a workspace you trust; its bots and AI providers may receive shared content.
-Folder transfers are limited to 256 KiB per file and do not follow links or
-delete files. Local screen control also needs OS permissions and a supported
+A folder read takes a file of up to 2 MiB and a write at most 256 KiB;
+transfers do not follow links or delete files. Local screen control also needs OS permissions and a supported
 desktop driver. Microphone access is not included.
+
+**Make the server your bots' home.** Bots work together only within one
+place: bots on this computer can't reach bots on the server. To bring them
+together, right-click the server's circle at the window's left edge and choose
+**Make <server> my home**. The app moves this computer's bots, chats, memory,
+skills, logins, apps and keys, and routines there the way it moves them to My
+Cloud: everything is copied while you keep working, then at a quiet moment this
+computer stops for good, the rest goes, both sides are checked, and the server
+switches on what was on here, so no routine ever runs twice. The account area
+says how it goes, and after a day of failing it says the move needs you, with
+Try again. Afterwards the server is what the window opens, and this computer
+works for it by itself as it does for My Cloud: no access dialog, only the
+menu bar's item with Pause.
+
+Until then, a bot that asks for a teammate living in your other place says where
+that teammate lives and how to bring them together, instead of only that it
+can't reach it: the app tells each place of yours the names of the bots your
+other places have, and nothing more.
+
+This is offered only for a server that is yours alone: you paired with it as an
+admin, and its sign-in list names no members and no other admin (Settings →
+People). A server other people sign in to keeps the explicit **Share this
+computer?** flow above, and its bots stay where they are. Both sides need this
+release: an older server says to update it first.
+
+To move by hand instead, export a backup from this computer in **Settings →
+Backups → Export backup**, then import it on the server in **Settings → Backups
+→ Import backup**. API keys, engine sign-ins and paired devices stay where they
+are on both sides; routines arrive paused. An older desktop app's **Copy this
+computer here** is answered with "Update OpenMausBot to bring your bots here by
+itself."
+
+Only conversations you start yourself on that server can use what you share;
+other people's bots, routines and webhooks there cannot. Keys and sign-in
+stores (`~/.ssh`, cloud CLIs, browser profiles, keychains) and `.git`
+internals stay out of reach of any shared folder, and the desktop keeps a log
+of every request under **Computer access**.
 
 Sharing works while this desktop is awake and running, including when viewing
 another workspace. **Stop sharing** revokes access; closing the app stops the
@@ -432,8 +500,8 @@ bots or conversations. If sign-out cannot reach the server, the app warns you;
 revoke its session there when reachable again, or if the device is gone.
 
 What this changes about the trust model: the server still binds loopback
-and still trusts loopback as the owner. A **paired session** is the second
-way in: a bearer token or the cookie, same-origin only, with a scope (`admin`
+and still trusts programs on loopback as the owner, though never a browser
+(below). A **paired session** is the second way in: a bearer token or the cookie, same-origin only, with a scope (`admin`
 by default, `--client` for a device that may chat but not change settings or
 pair others). Five bad codes from one address lock that address out for ten
 minutes. Over plain HTTP (a LAN address without TLS) the cookie is not
@@ -455,18 +523,47 @@ address of its own:
 
 ```sh
 ssh -L 8799:localhost:8799 you@your-server
-# then open http://localhost:8799 — loopback, so no pairing needed
+# then run `openmausbot pair` on the server and open the "this computer:" link it prints
 ```
 
-(With `OMB_LOOPBACK_TRUST=service`, below, a tunnel is loopback without a
-session: the page asks you to sign in or pair first, because it no longer
-makes you the owner.)
+The browser signs in once through the tunnel, like any browser on the server
+itself.
+
+### A browser signs in
+
+A browser never gets loopback trust, on any server: a request that carries
+the `Sec-Fetch-Site` or `Sec-Fetch-Dest` header (every browser sends them to a
+loopback address, and a page cannot remove them), or a WebSocket handshake
+with an `Origin`, needs a session: a web page is not the person who owns the
+server, even when it runs on the same machine. Programs are unaffected: the
+CLI, scripts, `curl` and the companion send neither header.
+
+So the first time you open the web UI in a browser on the server's own
+machine, it shows the sign-in page. `openmausbot serve` and `openmausbot pair`
+print a link for it:
+
+```
+this computer: http://127.0.0.1:8799/pair#code=XXXX-XXXX-XXXX
+```
+
+Open it and choose **Connect** (or type the code on the sign-in page); the browser
+keeps its session cookie from then on. `openmausbot` (the guided start) prints
+the same link when it opens the browser. The desktop app is unaffected:
+its window adds the app's own per-launch owner header to every request and
+WebSocket it sends to its server, and no other Electron session may reach the
+server at all.
+
+For development, `pnpm dev:server` sets `OMB_DEV_TRUST_LOCAL_BROWSER=1`, so a
+browser on Vite's dev page (`pnpm dev`) is the owner as before. The server
+honours it only when it runs from source with owner trust, logs a warning, and
+ignores it in a build, the desktop app, a hosted workspace and MausBot Cloud.
+Run `OMB_DEV_TRUST_LOCAL_BROWSER=0 pnpm dev:server` to try the sign-in.
 
 ### Loopback trust: owner or service
 
 Every bot's shell runs on the server as the same user, so every bot is a
 loopback caller too. On a server one person uses that is fine: the bots are
-theirs. On a workspace several people share it is not: a member could ask a
+theirs. On a workspace several people share it is not: a user could ask a
 bot to `curl` the local API and change settings, keys, MCP servers or
 webhooks as the owner. The server therefore decides at start-up how far a
 loopback request **without a session** is trusted, and logs it:
@@ -494,7 +591,8 @@ Set `OMB_LOOPBACK_TRUST=service` on a self-hosted server people share (with
 an email sign-in list, say), or `OMB_LOOPBACK_TRUST=owner` to opt a hosted
 workspace back into the old behaviour (the log then warns). Any other value
 means `service`. The desktop app ignores the setting: its local changes
-already need the app's own per-launch capability.
+already need the app's own per-launch capability. MausBot Cloud ignores
+it too and is always `service` (docs/cloud-pro.md).
 
 With `service` on a self-hosted server:
 
@@ -516,12 +614,12 @@ everything the Slack worker does, and on a shared workspace that is a real
 gap: it can post into any bot's thread through the guarded route, including
 an existing Full-access thread (`expectedApprovalMode: "full"`), and while
 shared Full access is on it can open new Full-access threads. Either way the
-work runs with Full access and no card, so a member who can talk to a bot
+work runs with Full access and no card, so a user who can talk to a bot
 can get Full access through it. It can also stop a request and decline a
 card. It cannot approve a card, change settings, keys, people or sessions,
 or loosen a bot's permissions. The planned fix is a relay token that only
 the Slack worker holds, so these routes stop answering session-less loopback
-at all; until then, turn shared Full access on only where every member may
+at all; until then, turn shared Full access on only where every user may
 have Full access. Files the server's user owns (`config.json`, the engine's
 environment) are also still readable from a bot's shell; that needs a
 second user for engines, a separate change.
@@ -549,7 +647,7 @@ npx openmausbot access list
 ```
 
 An entry is an address or `@domain` (everyone at that domain). Admins get
-the same access as a pairing code from `openmausbot serve`; members get the
+the same access as a pairing code from `openmausbot serve`; users get the
 chat-only scope, the same as `openmausbot pair --client`. The same lists live
 in `config.json` under `signIn.admins` and `signIn.members` and can be changed
 through the settings API without a restart; the environment variables win
@@ -572,7 +670,7 @@ seen, and what each person spent this month. **Invite** adds an address (or
 with the address filled in, and the one-time code still goes to that address.
 Roles change with one click; removing someone stops new sign-ins.
 
-On a hosted workspace whose members your organisation's Admin manages
+On a hosted workspace whose members your organization's Admin manages
 (`OMB_ADMIN_MEMBERSHIP=portal`), this list decides nothing, so Settings →
 People shows, read-only, who has signed in and what they spent, with a
 **Manage people in Admin** link to that workspace in Admin → People. Remote
@@ -583,17 +681,17 @@ hosted workspace refuses them.
 
 Approval cards are the provider's own (see the approval modes); OpenMausBot
 adds none. On a workspace several people share — portal membership, or an
-email sign-in list that names members — it narrows only whose answer counts,
+email sign-in list that names users — it narrows only whose answer counts,
 and only when the card can be traced to a person:
 
-- a card for a request a member sent, or in a thread a member opened, is
+- a card for a request a user sent, or in a thread a user opened, is
   theirs to answer (admins and the owner may answer any card);
-- a thread a bot opened while working on someone's request (a delegated or
-  coordinated job) is traced back to that person, so the cards of work done
+- a thread a bot opened while working on someone's request (a job it handed
+  a teammate with `coordinate_bots`) is traced back to that person, so the cards of work done
   for them are theirs too;
 - a card that names nobody — sent by the owner on this machine, by a
   routine or webhook, from Slack (until Slack passes the asker through), or
-  in a thread from before this existed — may be answered by any member, as
+  in a thread from before this existed — may be answered by any user, as
   before;
 - a session-less local caller under `service` trust may only decline.
 
@@ -605,8 +703,10 @@ server-private file (`<data dir>/thread-starters.json`), never sent to clients.
 ### Who can see a bot
 
 On a workspace several people share, an admin can limit who sees a bot:
-**Bot settings → Who can see it** (in the browser, for admins) or
-`PATCH /api/bots/:id` with `visibility`:
+**Bot settings → Who can see it** (in the browser, for admins), or when
+creating it — **New bot** offers the same choice, and `POST /api/bots` and
+`POST /api/teams/import?visibility=…` take it — so a bot for a sensitive job
+is never shown to everyone first. Over the API it is `visibility`:
 
 - `"everyone"` — every signed-in person, the default and today's behaviour;
 - `"admins"` — admin sessions only;
@@ -614,45 +714,74 @@ On a workspace several people share, an admin can limit who sees a bot:
   addresses and `@domain` entries, plus admins.
 
 It is access control, not an approval step, and it applies at once. For a
-member who may not see a bot, the server answers the bot, its threads and
+user who may not see a bot, the server answers the bot, its threads and
 their messages, images, exports, reactions, cards, sends, routines, runs and
 attachments exactly as it answers an id that does not exist (404), and leaves
 the bot out of the bot list, search results, routines, webhooks, the team map
-and the live event stream. When an admin changes a bot's audience, the
-members who lose it get it withdrawn from their open app (a `bot.deleted`
-frame), and those who gain it receive it whole.
+and the live event stream. Every bot a user is sent, by any route, comes
+without its audience list or the ids of teammates they cannot see. When an
+admin changes a bot's audience, every user's open app reconnects and
+reloads exactly what that person may now see (a user who was away and
+resumes from an older point gets the same fresh load); admins' apps are left
+alone.
 
-- **Rooms.** A member sees a room only if it has at least one bot and they
-  can see every bot in it. A room is one shared transcript, so a restricted
-  bot's words there would otherwise reach people who cannot see the bot.
-  Putting a restricted bot in a room therefore narrows that room too. A
-  member cannot create a room with a bot they cannot see.
-- **Teams.** A team (sidebar section) is listed to a member only when it
+- **Rooms.** A room is one shared transcript, so its bots must be visible
+  to the same people: creating a room, adding a bot to one, or scheduling a
+  call between bots that other people see differently is refused with a
+  plain sentence (for admins too). If an admin later restricts a bot that
+  is already in a room, the change is allowed and the room narrows to the
+  people who can see all its bots. A room also keeps the narrowest audience
+  it has ever had (its floor): taking the restricted bot out, deleting it,
+  or widening it again never shows the transcript to more people. A user
+  sees a room only if they can see every bot in it and the floor admits
+  them. Such a room stays out of the recall, recent-work brief and daily
+  memory log of any bot more people can see, and that bot cannot write
+  notes from it into its memory — so a bot everyone sees cannot repeat, in
+  a chat with anyone, what a restricted bot said there. To widen a room, an
+  admin says so explicitly: **Bot settings → Who can see it** lists the
+  rooms visible to fewer people than the bot, each with **Show … to everyone
+  its bots allow** (`PATCH /api/groups/:id` with `{"resetAudience": true}`),
+  which resets the floor to what the room's current bots allow and is
+  recorded in the admin activity log.
+- **Departments.** A department (sidebar section) is listed to a user only when it
   holds a bot or room they can see.
-- **Bots working together.** A bot reaches a teammate (asks, delegations,
-  its roster and `list_bots`, @mentions, a Chief's team) only when exactly
-  the same people can see both: otherwise one bot's thread could carry the
-  other's answers to people who cannot see it. Bots nobody restricted all
-  share "everyone", so nothing changes until an admin restricts one.
+- **Bots working together.** A bot reaches any teammate, in any department
+  (`coordinate_bots`, its roster and `list_bots`, @mentions, a Chief's team),
+  but only when exactly the same people can see both: otherwise one bot's
+  thread could carry the other's answers to people who cannot see it. Bots nobody restricted all
+  share "everyone", so nothing changes until an admin restricts one. A bot a
+  Chief creates (directly, or in a reviewed team setup) gets exactly the
+  Chief's audience, and a copy of the Chief's connected apps.
 - **Who sees everything.** Admin sessions, the owner on this machine, and a
   session-less local service (the Slack worker under `service` trust) see
   every bot. A pairing-code device with no email sees only bots everyone
-  can see. Members never receive a bot's audience list.
+  can see. Users never receive a bot's audience list.
 - **Files.** An attachment is refused only when everything that uses it —
-  a message in a thread, a bot's picture — is hidden from that member. A
+  a message in a thread, a bot's picture — is hidden from that user. A
   file nothing uses yet (someone's own upload) is served; its name is random.
-- **Not covered.** Words already quoted into a conversation a member can
-  see (an earlier delegation, a message copied by hand) stay there. A bot's
+- **Not covered.** Words already quoted into a conversation a user can
+  see (an earlier hand-off, a message copied by hand, or something a bot
+  wrote into its own memory files with its file tools while it shared a room
+  with a restricted bot) stay there. A bot's
   shell can still read files on the server, as it always could. Slack is
-  decided in your organisation's Admin: whoever may message a bot's Slack
+  decided in your organization's Admin: whoever may message a bot's Slack
   app reaches that bot there.
 
-The desktop app has no member sessions and does not show this setting;
+The desktop app has no chat-only user sessions and does not show this setting;
 nothing there changes.
 
 On the Workspaces screen, creating a client workspace shows the same kind of
 link for that workspace's admin, so a client gets one address, one workspace
 and one link.
+
+## Attachment storage
+
+Files people attach, and pictures a bot shows inline, live in the
+`attachments` folder of the data directory. Nothing there is deleted, since
+old messages still point at it, so the server stops taking new files once the
+folder holds 512 MB. A team fills that sooner: set
+`OMB_ATTACHMENTS_MAX_BYTES` in the server's environment and restart, for
+example `OMB_ATTACHMENTS_MAX_BYTES=4294967296` for 4 GB.
 
 ## Putting a proxy in front
 
@@ -673,6 +802,38 @@ Plus one convenience: set `OMB_PUBLIC_URL=https://your.domain` so pairing
 links, and `OMB_WEBHOOK_PUBLIC_URL=https://your.domain` so hook URLs, are
 printed with the public address. [`deploy/Caddyfile`](../deploy/Caddyfile)
 is the reference implementation.
+
+## Opening a desktop from another device
+
+In a paired admin browser, as in the desktop app, **Take control** turns the
+Computer panel's picture into the live desktop for Local VMs and your own VPS,
+through the same address as OpenMausBot; **Full screen** fills the window with
+the same session. Shared, per-bot and pool Local VMs connect through their
+managed container's loopback port. VPS desktops connect
+through an SSH tunnel opened by the server. Neither needs an additional public
+port or viewer origin setting. Keep Local VM VNC ports bound to loopback and
+VPS VNC ports private.
+
+Your app reverse proxy must support WebSocket upgrades, preserve `Host`, and
+set `X-Forwarded-Proto` to the browser-facing scheme. This also applies when
+using Tailscale Serve. Viewer requests require an admin session. Logging out
+or revoking that session closes open viewers. Client-only pairing does not
+grant desktop control.
+
+An open Local VM viewer keeps that VM's idle timer active. Remote VPS viewers
+share a tunnel; it closes 30 seconds after the last viewer leaves, allowing
+reconnects during that interval. **Hand control back**, closing the panel or
+leaving the page gives the computer back to the bot.
+
+Use **Keyboard** to send text from a phone and **Clipboard** to exchange text
+with the desktop; clipboard edits sync automatically. The desktop fits the
+window, with fullscreen available when the browser supports it. Hosted Cloud
+keeps its provider-issued viewer in its own window or tab.
+
+These controls are in the web app. The native phone apps have their own
+computer viewers; use a paired browser for interactive Local VM or VPS access.
+For the proxy boundary and offline regression checks, see the
+[viewer verification recipe](verification/desktop-viewer.md).
 
 ## Using it from your phone
 
@@ -706,7 +867,7 @@ Older way, still supported, and only useful on a LAN or a tailnet: run the
 companion sidecar next to the harness and pair by its own QR. It advertises
 on your private networks (Tailscale-aware) and issues its own per-device
 credentials, which are **not** `openmausbot sessions` and are revoked from
-its own page on `127.0.0.1:8811`. It also serves phones over cleartext HTTP
+its own page at the `127.0.0.1:8811/#token=…` link it prints. It also serves phones over cleartext HTTP
 on port 8810, so do not expose it from a public server. It ships only in a
 git checkout: neither the npm package nor the Docker image contains it.
 
@@ -735,6 +896,99 @@ curl -H "Authorization: Bearer $TOKEN" -o usage.csv \
 Dates are inclusive, UTC, at most a year apart; without them you get the
 current month to date.
 
+### When an engine runs out
+
+When a turn ends on a usage limit (a subscription's 5-hour or weekly limit,
+one model's own weekly window, a model's extra usage credits), the bot carries
+on by itself with another AI the person has set up until that limit resets,
+and the person hears it once for that stretch of the limit, as a notification:
+"Codex reached its limit until 14:00, so Kai is using Claude meanwhile." With
+no AI to carry on, it says the bot waits instead. Nobody is asked.
+
+- **Which AI.** For one model's own limit, the same AI's default model first;
+  then the backups chosen for the bot or in Automatic recovery; then the AI a
+  new bot would get. Only an AI that can run a turn now (installed, signed in,
+  allowed by your organisation, not limited itself) with the tools and the
+  working folder the current one has, and one the conversation's approval level
+  can move to without asking (Auto-accept edits stays on an AI that has it).
+  Never another sign-in to the same subscription, which would rotate accounts
+  around the provider's limit; a pay-per-use API key on the same AI is fine.
+- **What moves.** The person's message that met the limit is sent again on that
+  AI, in that conversation alone; the bot's own model and its other
+  conversations stay where they are. While the limit lasts, every new turn and
+  conversation of every bot that uses the limited AI (a person's, a routine's,
+  a webhook's) goes straight to that AI without asking the limited one first,
+  and a routine run the limit stopped starts again on it.
+- **How long.** The limited AI is held until the reset it named, or for an hour
+  when it named none or named one already past; the next turn after that hour
+  checks it again. One model's own limit holds that model alone, and for at
+  most six hours before it is tried again. The holds are saved
+  (`limit-holds.json`, `limit-takeover-holds.json`), so a restart, an update or
+  a sleep the Cloud was stopped for keeps them. A conversation that moved goes
+  back once its AI's limit has reset, with one line saying so.
+
+An engine that posts the provider's raw error as its whole reply instead of
+failing the turn (omp's ACP mode sends `429 {"type":"error",…} retry-after-ms=…`
+that way) has that turn count as failed, not as a reply, and the person reads
+it in plain words. It is a usage limit when its words say so, or when it is a
+429 whose wait runs past two minutes, and is then held until that wait ends;
+a shorter wait is a rate limit to try again after. A reply that only quotes
+such an error among other words stays a reply.
+
+This is on by default. Start the server with `OMB_QUOTA_SWITCH=0` to switch it
+off: then only the backups Automatic recovery names take over, and the
+notification says the bot waits. Any other value, or none, leaves it on. It
+has no setting in `config.json` yet.
+
+### When an engine is signed out
+
+When a turn stops because its AI is signed out (its sign-in expired or was
+revoked), the person hears it once, in that conversation and as a
+notification: "Claude is signed out on the Cloud. Sign in again in Settings →
+AI to keep using it.", with a Sign in button that opens those settings. Each
+later refused turn still shows that it failed, with no second notice; its
+Chief gets one incident, not one a turn. An account out of credit, which some
+engines stop the same way, is no sign-out.
+
+The backups a turn its AI never started would get carry on meanwhile (the
+bot's own backup AIs, or else the app-wide backup while Automatic recovery is
+on), by the same rules as a usage limit (another sign-in to the same AI is fine
+here, since nothing is rotated around a limit): the person's message is sent
+again there, every new turn and conversation starts there, and a conversation
+that moved goes back once the AI is signed in again in the app, or a turn on it
+works. No AI is picked for a sign-out by itself, so with no such backup nothing
+moves. A new turn tries the signed-out AI again an hour after its last refusal,
+unless its status still says signed out.
+
+### Which engine a new bot uses
+
+A saved default model (Settings, `openmausbot setup`, or the New Bot
+defaults) always wins. Without one, new bots get the first engine that can
+run, in this order: a Claude account, a ChatGPT plan, Gemini, Grok, then the
+rest in the order of `instances`; OpenCode running only Zen's free no-login
+models comes last.
+
+The server picks at once at start, then sends the person's own engines one
+tiny test message each in the background ("Reply with the single word OK",
+90 seconds at most), best first, stopping at the first that answers. One
+miss alone doesn't move the default: that engine is tried again two minutes
+later. Two misses in a row move the default to the best engine that
+answered; the engine is tried again ten minutes later, then once an hour.
+An engine that already answered (for example one the welcome checked) can
+take the default after a single miss. An organization's models and the
+trial credit are never tested this way. Results are kept for a day per
+engine and sign-in in `<data dir>/providers/ai-checks.json`, so a restart
+doesn't send them again. On a later start, where the engines are read one at
+a time, nothing is tested or moved until that read ends: never on the status
+the last run recorded.
+
+The first bot the app made follows the default until someone writes to it
+or picks a model for it or one of its conversations: it moves only after a
+test result, only to an engine that answered, and only away from one whose
+latest test missed or that is signed out or turned off, or up to a better
+one. A status read that timed out moves nothing. No other bot ever moves. To stop the
+background test messages, start the server with `OMB_AI_CHECKS=0`.
+
 ### The decision log
 
 Every approval decision — a rule that let a tool call through, a card that
@@ -758,21 +1012,86 @@ The CSV has one line per decision (time, decision, source, bot, tool,
 summary, rule, unattended, answered by, thread, request); cells that would
 start a spreadsheet formula are prefixed with `'`.
 
+### The safety floor
+
+Full access answers every permission request for a bot, and a saved command
+answers one. The safety floor is a short never-list that neither can answer:
+a recursive delete of the filesystem root, of the home directory or of a
+top-level system directory (`rm -rf /`, `rm -rf ~`, `rm -rf /etc`);
+formatting or overwriting a disk (`mkfs` on a device, `diskutil eraseDisk`,
+`dd of=/dev/sda`, a redirection into a disk device); and a fork bomb. Making
+a filesystem in an image file or on a loop device is not on it.
+
+It is off unless you switch it on: set `safetyFloor.enabled` to `true` in
+`config.json` (or through `PUT /api/config`), or start the server with
+`OMB_SAFETY_FLOOR=1`, which turns it on whatever the file says.
+`GET /api/config` reports whether it is in force as `safetyFloor.enabled`.
+
+**It is not applied on a Windows server yet.** There the setting is accepted
+and does nothing: no command is checked, denied or held, and every approval
+behaves as it does with the setting off. The server says so once at startup
+(`[safety-floor] … not applied on a Windows server yet`), and
+`GET /api/config` reports `safetyFloor.enabled: false`. Telling cmd,
+PowerShell and Git Bash apart needs to know which shell a request is for,
+which the server does not know yet.
+
+With it on, on macOS or Linux, a command on the list that a grant was about
+to allow is denied instead. The bot is told why, the conversation shows
+`Blocked by the safety floor: …`, and the decision log gets an `auto-denied`
+row with source `safety-floor`. A card you answer yourself is not overridden:
+at "Ask for approval" the request still reaches you, and your Allow stands.
+
+A command the floor cannot read is not approved automatically either: one
+with a quote or heredoc that never closes, or longer than 32 KB. The request
+comes to you as a card instead, and the server log says so once, without the
+command. An API-key bot at Full access has no card to show, so there the call
+is refused.
+
+It reads a command as a POSIX shell line. cmd commands (`rd /s /q`,
+`format C:`) are not evaluated: a Mac or Linux machine does not run them, so
+a server there that drives a Windows machine gets no protection for what
+runs on it. PowerShell is the exception, because PowerShell 7 runs on macOS
+and Linux: what follows `pwsh -c` or `powershell -Command` is read too, both
+as a POSIX line and as PowerShell, so `pwsh -c 'rm -rf /'` and
+`pwsh -c 'Remove-Item -Recurse -Force $HOME'` are blocked.
+
+It holds wherever the engine asks the server, and only there. API-key models
+(the chat runtime) are covered in full, at Full access and under "Always
+allow this session". So is any shell request Claude Code, Codex, Muse Code or
+an ACP agent sends, whether a saved command, a kept session allow or Full
+access would have answered it: the engine's command line travels with the
+request, so it is read even when its working directory is not known. An
+engine running its own no-ask mode never sends a request, so the floor does
+not see the command: at Full access that is Claude Code
+(`bypassPermissions`), Codex (approvals off) and the ACP agents started in
+their own yolo mode. Treat it as a net under saved commands and API-key bots,
+not as a sandbox.
+
 ### Admin activity
 
-Every admin change is recorded beside the decision log, in
-`<data dir>/admin-activity/YYYY-MM.ndjson` (0600), and kept for the same
-window (`decisions.retentionDays` / `OMB_DECISION_RETENTION_DAYS`): settings
+On a workspace several people share — a hosted workspace, an email sign-in
+list that names more than one person or a whole `@domain`, or a device paired
+(or a pairing code open) with chat-only access, whether before or after the
+change — every admin change is recorded beside the decision
+log, in `<data dir>/admin-activity/YYYY-MM.ndjson` (0600), and kept for the
+same window (`decisions.retentionDays` / `OMB_DECISION_RETENTION_DAYS`; a
+quiet server prunes on a timer, and pending rows are written out at
+shutdown): settings
 (which keys changed), sign-in lists and people, pairing codes and revoked
 sessions, webhooks, MCP servers, engines and keys, bots created, deleted or
 given different permissions, spend limits and prices, and who can see a bot.
 Each row names who acted — the session's email or device label, `This
 computer` for the owner, `Command line` for `openmausbot` commands such as
 `openmausbot access add` — and the values before and after. Values are
-redacted: anything under a key that names a credential, and every value in a
-headers or environment map, is written as `[hidden]`, so a key change shows
-that the key changed and never the key. The desktop app, which one person
-uses, keeps no such log.
+redacted: anything under a key that names a credential, every value in a
+headers or environment map, the value after a flag such as `--api-key` or
+`-k`, URL parameters such as `?key=`, a token before a URL's host
+(`https://TOKEN@host`), and key-like URL path parts (`/s/<key>/sse`) are
+written as `[hidden]`, so a key change
+shows that the key changed and never the key. Each row covers only what that
+request named or saved, so two admins changing things at the same moment are
+each credited with their own change. The desktop app, and a server one person
+uses, keep no such log.
 
 **Settings → Activity** (admins, in the browser) shows these rows together
 with the cards people answered, filtered by who, what and when, and exports
@@ -789,31 +1108,44 @@ curl -H "Authorization: Bearer $TOKEN" -o activity.csv \
 `decisions` (every decision, automatic ones too), or one of `config`,
 `people`, `session`, `webhook`, `mcp`, `engine`, `bot`, `budget`,
 `visibility`; `who` matches part of a name or email; without `from` the list
-starts 30 days ago. Nothing here is sent to your organisation's cloud Admin,
+starts 30 days ago. Nothing here is sent to your organization's cloud Admin,
 which keeps its own activity log.
 
 ## Spend limits and sell prices (enterprise)
 
 With the `budgets` entitlement, **Settings → Usage → Monthly spend limit**
-caps the workspace: once the month's reported cost reaches it, no bot starts
-a turn, whether a person wrote, a routine fired, a peer asked or a webhook
-arrived, until an admin raises it. The figure is what engines report to the
-ledger: real on your keys, an equivalent on personal subscriptions. A warning
-shows at a configurable percentage.
+caps the workspace: once the month's cost reaches it, no bot starts a turn,
+whether a person wrote, a routine fired, a peer asked or a webhook arrived,
+until an admin raises it. A warning shows at a configurable percentage, and
+admins get one in-app notification the first time each month crosses the
+warning and one when it reaches the limit (a new month or a new limit starts
+over).
+
+The figure is every cost in the usage ledger. Claude reports its own cost
+(real on your keys, an equivalent on personal subscriptions). Codex, the
+OpenAI-compatible/OpenRouter engine, Grok, MiniMax and the ACP engines report
+tokens but no price, so the server books an **estimate** from a built-in list
+of vendor list prices (`server/model-prices.ts`, each entry with its source
+and the date it was read) and marks the row `costSource: "estimated"`. A model
+that is not in the list is unpriced and not counted; Usage says how many
+turns that was. Estimates use each vendor's standard short-context rate, so
+long prompts, cache writes and priority tiers cost more than estimated.
 
 With the `billing` entitlement, **Sell prices** takes your own price per
 million tokens by model id, `driver/model`, or `default`, and History and the
-CSV export gain a **billable** column next to the provider's cost. Both are
-plain settings in `config.json` (`budgets`, `billing`) and through
-`PUT /api/config`.
+CSV export gain a **billable** column next to the provider's cost. For an
+engine that reports no cost, a price you set for that exact model also
+replaces the list price in its estimate; `default` is used only for models
+the list does not know. Both are plain settings in `config.json` (`budgets`,
+`billing`) and through `PUT /api/config`.
 
 ## A bot that also runs outside the server
 
 Some engines have their own long-running front door — a Hermes Agent Telegram
 gateway, a Slack bot, an OpenClaw session. That process is the same bot with
 the same workspace and memory, but the server did not spawn it, so it holds
-none of the turn-scoped capabilities the peer-comms tools need and cannot ask
-or delegate to its teammates.
+none of the turn-scoped capabilities the peer-comms tools need and cannot hand
+work to its teammates.
 
 Give it a standing one with `external-runtimes.json` in the data directory,
 mapping the bot's id to a secret of at least 32 characters and one existing
@@ -851,15 +1183,24 @@ OMB_HARNESS_URL=http://127.0.0.1:8799 OMB_BOT_ID=$BOT_ID OMB_THREAD_ID=$THREAD_I
 ```
 
 Scope is deliberately narrow: the token is an *agents* capability for that
-bot's pinned thread only, and the server accepts just four routes with it — list
-peers, ask, delegate, and read the status of its own delegations. Opening
-threads, creating bots or rooms, skills, memory and every other internal route
-answer 403. External mode advertises only `list_bots`, `ask_bot`, `delegate_bot`,
-`check_delegation` and `wait_delegation`. It can check a delegation from the
-same long-running process without inventing a turn end. The server still
-enforces peer access and approval settings. An idle source starts dispatch
-immediately; a busy teammate is queued until available. Regular in-app turns
-keep their existing dispatch timing.
+bot's pinned thread only, and the server accepts just three kinds of route
+with it — list peers (`GET /api/internal/agents`), hand work on
+(`POST /api/internal/coordinate-bots`) and read how it went
+(`GET /api/internal/assignment-status`). Opening threads, creating bots or
+rooms, skills, memory and every other internal route answer 403. The bridge
+offers the one tool surface every turn gets (docs/runtime-contract.md §9):
+`coordinate_bots` (work; a question with `consult: true`; a one-way notice
+with `reply: "none"`) and the read-only `assignment_status`. Every call from
+the standing capability is its own root on the job
+runtime with `reply: poll`: it completes without a turn once the teammates'
+work settles, and the runtime reads the results with `assignment_status`,
+long-polling `wait_ms` (at most 240 s) on the root's `rootId` or a receipt's
+`requestId` from the same long-running process, without inventing a turn end.
+A settled hand-off never wakes the bot's own engine on that thread. The
+server still enforces peer access and approval settings. A free teammate
+starts at once; a busy one is queued on the runtime until a slot frees
+(docs/runtime-contract.md §2). Regular in-app turns keep their existing
+dispatch timing.
 
 The credentials stay on this server and are excluded from workspace backups;
 restoring a backup preserves destination registrations. Never put this token
@@ -867,6 +1208,61 @@ in chat or source control. Everything else the server offers still needs the
 owner's session or a per-turn capability.
 
 Verification: [external runtime fixture](verification/external-runtime.md).
+
+## A bot stuck on a failing command
+
+Every server shows a chat notice when a bot repeats the same tool call 5, 10
+and 20 times in one turn. That notice only tells you. The loop guard, which is
+off by default, also tells the bot:
+
+- Set `loopGuard.enabled` to `true` in `config.json` (or through
+  `PUT /api/config`), or start the server with `OMB_LOOP_GUARD=1`. When the
+  same whole shell command fails the same way five times in a row
+  (`loopGuard.steerAt`, 2-1000), the server puts one short note into the
+  running turn saying so. A command that succeeds, or that fails differently,
+  ends the count, so a turn that re-runs its tests after each edit or polls a
+  build is left alone.
+- Stopping the turn is a separate choice. Set `loopGuard.stopAt` (2-1000), or
+  `OMB_LOOP_GUARD_STOP_AT`, and the turn is stopped at that many identical
+  failures in a row, with a line in the chat that names the command and offers
+  Retry. Leave it unset and the guard never stops a turn. A wait that fails
+  until something is ready (`curl -f` against a server that is still starting)
+  counts as a failing command, which is why the stop is not on by default.
+
+The note needs an engine that accepts a message in the middle of a turn
+(Claude Code, Codex, Pi, Muse Code). ACP agents cannot take one, so they get
+only the stop, and only if you set it. The note and the stop do not cover bots
+on API models or turns in a room yet.
+
+Bots on API models (xAI, Mistral, Groq, Greenference, Cerebras, Meta, MiniMax or an
+OpenAI-compatible endpoint) end a turn as failed when a tool call failed and
+the bot then answered. With the loop guard on, set `loopGuard.correctiveRounds`
+(0-5, default 0) and such a bot is sent back to re-run the failed call up to
+that many times first; the turn counts as done only if the tools it runs after
+that succeed. A tool call that was denied is never sent back.
+
+## A turn that goes silent
+
+The server stops a turn that has sent it nothing for 20 minutes
+(`OMB_TURN_STALL_MS`) and says why in the chat. Engines report a tool only
+when it starts and when it ends, so while one of the turn's tools is still
+running the turn may stay silent for up to `OMB_TOOL_STALL_MS` (default 2
+hours). Any event from the turn starts the silence over, and time spent waiting
+on a person or a computer never counts. Either way the turn stops with "no
+activity for N minutes".
+
+Both take whole milliseconds. `OMB_TURN_STALL_MS` is never below 60000 (one
+minute) and `OMB_TOOL_STALL_MS` never below `OMB_TURN_STALL_MS`. A value that
+is not a positive finite number (empty, `65m`, `0`, a negative number,
+`Infinity`, `1e309`) leaves the default. Set them in the server's environment
+and restart it; the restart stops every running turn.
+
+A turn in a room also has a limit of its own, `rooms.turnTimeoutMinutes` in
+`config.json` (default 5 minutes, 1-1440, which one conversation can replace).
+It stops a member's turn that shows no progress for that long. While one of the
+turn's tools runs, the turn may show nothing for up to 60 minutes (the longest
+an MCP call can be set to take) or the room's limit if that is longer. These two
+settings do not change it.
 
 ## Updating
 
@@ -880,8 +1276,11 @@ docker compose -f deploy/docker-compose.yml pull omb && docker compose -f deploy
 git pull && pnpm install && sudo systemctl restart openmausbot          # from source
 ```
 
-Routines and queued work survive restarts; in-flight turns do not, so
-update between runs.
+Routines and queued work survive restarts. A teammate turn in flight runs
+again once at the next start, told to check what it already did, and the bot
+that asked for it is told. A person's own turn and a running routine are not
+run again: the conversation says it was interrupted. Update between runs
+where you can.
 
 Stop the server before a filesystem backup so SQLite is copied consistently.
 Back up the entire app data directory and, separately, the service user's

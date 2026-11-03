@@ -1,5 +1,7 @@
 import { parse as parseYaml } from "yaml";
 import { parseTeamBackup, TEAM_BACKUP_CONTENTS } from "../../shared/team-backup";
+import { NEWER_PACKAGE_MESSAGE, PACKAGE_VERSION, parsePackageDocument, type PackageDocument } from "../../shared/package-format";
+import { composioSlugFor, grokExportToPackage, isGrokExport, parseGrokExport, type GrokLeftOut } from "../../shared/grok-import";
 
 export interface PendingTeamImport {
   manifest: unknown;
@@ -16,10 +18,59 @@ export interface PendingTeamImport {
   conversations?: number;
   archivedBots?: number;
   warnings?: string[];
+  version?: number;
+  teamName?: string;
+  brief?: string;
+  pictures?: Array<string | null>;
+  offeredSkills?: string[];
+  connections?: Array<{ label: string; url: string; values: number }>;
+  notes?: number;
+  presets?: string[];
+  library?: boolean;
+  /** The warnings list what a Grok Bot export could not carry. */
+  leftOut?: boolean;
+  /** What is left to do after a Grok Bot import, for the Chief of Staff's prepared message. */
+  grokSetup?: GrokSetupNotes;
 }
 
-/** Small client-side preview only; the server remains the trust boundary. */
+export interface GrokSetupNotes {
+  sourceUrl?: string;
+  /** Apps with a Composio toolkit, to connect. */
+  apps: Array<{ label: string; slug: string }>;
+  /** Grok Bot plugins Maus has no match for. */
+  unmatched: string[];
+  leftOut: GrokLeftOut[];
+}
+
+export interface GrokPreviewOptions {
+  /** The x.ai/bot link the export came from, credited as the author's link. */
+  sourceUrl?: string;
+  /** For routines whose export named no zone; the computer's own by default. */
+  timeZone?: string;
+}
+
+const leftOutLine = (item: GrokLeftOut) =>
+  `${item.name}: ${item.reason}.${item.original ? ` It said: ${item.original.length > 2_000 ? `${item.original.slice(0, 1_999)}…` : item.original}` : ""}`;
+
+/** A Grok Bot export (pasted reply or file) as the package preview, with what was left out as warnings. */
+export function grokImportPreview(input: unknown, options: GrokPreviewOptions = {}): PendingTeamImport {
+  const timeZone = options.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const x = parseGrokExport(input);
+  const { document, leftOut } = grokExportToPackage(x, { ...options, timeZone });
+  const sourceUrl = document.package.author.url;
+  const grokSetup: GrokSetupNotes = {
+    ...(sourceUrl ? { sourceUrl } : {}),
+    apps: document.package.requirements.apps.flatMap((app) => (composioSlugFor(app.label) === app.slug ? [{ label: app.label, slug: app.slug }] : [])),
+    unmatched: document.package.requirements.apps.flatMap((app) => (composioSlugFor(app.label) === app.slug ? [] : [app.label])),
+    leftOut,
+  };
+  const preview = { ...sharedTeamPreview(document, document), grokSetup };
+  return leftOut.length ? { ...preview, warnings: leftOut.map(leftOutLine), leftOut: true } : preview;
+}
+
+/** Client-side preview only; the server remains the trust boundary. */
 export function teamImportPreview(manifest: unknown): PendingTeamImport {
+  if (isGrokExport(manifest)) return grokImportPreview(manifest);
   if (typeof manifest === "string") manifest = markdownPackage(manifest);
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
     throw new Error("This file does not contain a team.");
@@ -90,7 +141,62 @@ function markdownPackage(markdown: string): unknown {
   return { format: "openmaus.package", version: 1, package: pkg };
 }
 
+function sharedTeamPreview(document: PackageDocument, manifest: unknown): PendingTeamImport {
+  const pkg = document.package;
+  if (!pkg.agents.length) return libraryPreview(document, manifest);
+  const referenced = new Set(pkg.agents.flatMap((agent) => agent.skills ?? []));
+  const leader = pkg.team?.leader ? pkg.agents.find((agent) => agent.key === pkg.team?.leader)?.name : undefined;
+  return {
+    manifest,
+    kind: "package",
+    version: 2,
+    name: pkg.name,
+    teamName: pkg.team?.name ?? pkg.name,
+    description: pkg.summary,
+    members: pkg.agents.map((agent) => ({ name: agent.name, title: agent.title ?? "" })),
+    ...(leader ? { chiefOfStaff: leader } : {}),
+    ...(pkg.team?.brief?.trim() ? { brief: pkg.team.brief } : {}),
+    pictures: pkg.agents.map((agent) => agent.appearance.avatar
+      ? `data:${agent.appearance.avatar.mime};base64,${agent.appearance.avatar.data}`
+      : null),
+    rooms: pkg.rooms?.length ?? 0,
+    playbooks: pkg.playbooks?.length ?? 0,
+    routines: pkg.routines?.length ?? 0,
+    apps: pkg.requirements.apps.map((app) => ({ label: app.label, optional: app.optional === true })),
+    skills: (pkg.skills?.entries ?? []).filter((skill) => referenced.has(skill.name)).map((skill) => skill.name),
+    offeredSkills: (pkg.skills?.entries ?? []).filter((skill) => !referenced.has(skill.name)).map((skill) => skill.name),
+    connections: (pkg.connections ?? []).map((connection) => ({
+      label: connection.label, url: connection.mcp.url, values: connection.mcp.valueNames.length,
+    })),
+    notes: pkg.agents.reduce((total, agent) => total + Object.keys(agent.seed?.memory ?? {}).length, 0),
+    presets: (pkg.presets ?? []).map((preset) => preset.name),
+  };
+}
+
+function libraryPreview(document: PackageDocument, manifest: unknown): PendingTeamImport {
+  const pkg = document.package;
+  if (!pkg.presets?.length) throw new Error("This file has no bots or preset bots to add. Its skills can be added from your organization's shelf.");
+  return {
+    manifest,
+    kind: "package",
+    version: 2,
+    library: true,
+    name: pkg.name,
+    description: pkg.summary,
+    members: [],
+    rooms: 0,
+    playbooks: pkg.playbooks?.length ?? 0,
+    routines: 0,
+    apps: [],
+    skills: [],
+    offeredSkills: (pkg.skills?.entries ?? []).filter((skill) => !pkg.presets!.some((preset) => preset.skills?.includes(skill.name))).map((skill) => skill.name),
+    presets: pkg.presets.map((preset) => preset.name),
+  };
+}
+
 function packagePreview(root: Record<string, unknown>, manifest: unknown): PendingTeamImport {
+  if (typeof root.version === "number" && root.version > PACKAGE_VERSION) throw new Error(NEWER_PACKAGE_MESSAGE);
+  if (root.version === PACKAGE_VERSION) return sharedTeamPreview(parsePackageDocument(manifest), manifest);
   if (root.version !== 1) throw new Error(`BotMRR playbook version ${String(root.version)} is not supported.`);
   if (!root.package || typeof root.package !== "object" || Array.isArray(root.package)) {
     throw new Error("This playbook is missing its team definition.");
@@ -127,6 +233,7 @@ function packagePreview(root: Record<string, unknown>, manifest: unknown): Pendi
   return {
     manifest,
     kind: "package",
+    version: 1,
     name: pkg.name.trim(),
     description: typeof pkg.summary === "string" ? pkg.summary.trim() : "",
     members,

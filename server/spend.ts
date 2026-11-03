@@ -1,12 +1,9 @@
-// Spend limits over the usage ledger: what this workspace has spent this
-// month against its cap, and the refusal a turn gets once the cap is
-// reached. The figure is the cost engines reported to the ledger, so on a
-// workspace of personal subscriptions it counts their equivalents too; on
-// keys it is what the operator actually pays. Enforced only with the
-// `budgets` entitlement; without it the setting is inert.
+// Monthly spend cap over the usage ledger; enforced only with the `budgets` entitlement.
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AppConfig } from "./config.ts";
 import { entitled } from "./enterprise.ts";
-import { readUsage } from "./usage-ledger.ts";
+import { readUsage, usageRowKey } from "./usage-ledger.ts";
 
 export interface SpendState {
   month: string;
@@ -20,42 +17,60 @@ export interface SpendState {
 
 const DEFAULT_WARN_AT_PERCENT = 80;
 const CACHE_MS = 15_000;
-// Every turn start asks; reading the month file each time would be silly.
-const cache = new Map<string, { at: number; month: string; spentUsd: number }>();
+const cache = new Map<string, { at: number; month: string; fileUsd: number; keys: Set<string> }>();
+// Rows whose async ledger append may not have landed yet: a long turn would otherwise re-read the month without its own row.
+const unwritten = new Map<string, Map<string, { month: string; costUsd: number }>>();
 
 function monthOf(now: Date): string {
   return now.toISOString().slice(0, 7);
 }
 
-/** Reported cost this month so far, from the ledger, cached briefly. */
+const costOf = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0);
+
 export function monthToDateSpend(dataDir: string, now = new Date()): number {
   const month = monthOf(now);
-  const hit = cache.get(dataDir);
-  if (hit && hit.month === month && now.getTime() - hit.at < CACHE_MS) return hit.spentUsd;
-  const from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-  const spentUsd = readUsage(dataDir, { from, to: now }).reduce(
-    (sum, row) => sum + (typeof row.costUsd === "number" && Number.isFinite(row.costUsd) ? row.costUsd : 0),
-    0,
-  );
-  cache.set(dataDir, { at: now.getTime(), month, spentUsd });
-  return spentUsd;
+  let read = cache.get(dataDir);
+  if (!read || read.month !== month || now.getTime() - read.at >= CACHE_MS) {
+    const from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const rows = readUsage(dataDir, { from, to: now });
+    read = { at: now.getTime(), month, fileUsd: rows.reduce((sum, row) => sum + costOf(row.costUsd), 0), keys: new Set(rows.map(usageRowKey)) };
+    cache.set(dataDir, read);
+  }
+  let pending = 0;
+  for (const [key, entry] of unwritten.get(dataDir) ?? []) {
+    if (entry.month === month && !read.keys.has(key)) pending += entry.costUsd;
+  }
+  return read.fileUsd + pending;
 }
 
-/** Called right after a turn is booked, so the next check sees it without
- * waiting for the ledger's append to land or the cache to expire. */
-export function noteSpend(dataDir: string, costUsd: number | null | undefined, now = new Date()): void {
-  const hit = cache.get(dataDir);
-  if (hit && hit.month === monthOf(now) && typeof costUsd === "number" && Number.isFinite(costUsd) && costUsd > 0) {
-    hit.spentUsd += costUsd;
-  }
+export function noteSpend(
+  dataDir: string,
+  row: { at: string; threadId: string; botId: string; costUsd: number | null | undefined },
+  written: Promise<boolean>,
+): void {
+  const costUsd = costOf(row.costUsd);
+  if (!costUsd) return;
+  const key = usageRowKey(row);
+  const month = row.at.slice(0, 7);
+  const entries = unwritten.get(dataDir) ?? new Map<string, { month: string; costUsd: number }>();
+  unwritten.set(dataDir, entries);
+  entries.set(key, { month, costUsd });
+  void written.then((landed) => {
+    entries.delete(key);
+    if (entries.size === 0 && unwritten.get(dataDir) === entries) unwritten.delete(dataDir);
+    const read = cache.get(dataDir);
+    if (landed && read && read.month === month && !read.keys.has(key)) {
+      read.fileUsd += costUsd;
+      read.keys.add(key);
+    }
+  });
 }
 
 export function resetSpendCacheForTests(): void {
   cache.clear();
+  unwritten.clear();
 }
 
-/** The cap and where the month stands against it; null when there is no
- * enforceable cap (no entitlement, or none set). */
 export function spendState(
   cfg: Pick<AppConfig, "budgets">,
   dataDir: string,
@@ -78,12 +93,10 @@ export function spendState(
   };
 }
 
-/** Dollars for a message: cents normally, mills for a cap under a cent. */
 function usd(value: number): string {
   return Number.isInteger(Math.round(value * 1000) / 10) ? value.toFixed(2) : value.toFixed(3);
 }
 
-/** Throws the HTTP-shaped refusal a turn start gets once the cap is reached. */
 export function assertWithinBudget(
   cfg: Pick<AppConfig, "budgets">,
   dataDir: string,
@@ -96,4 +109,56 @@ export function assertWithinBudget(
     new Error(`this workspace has reached its monthly spend limit of $${usd(state.monthlyUsd)} — an admin can raise it under Settings → Usage`),
     { status: 409, code: "spend_cap" },
   );
+}
+
+export type SpendAlert = "warn" | "cap";
+
+interface AlertMarks {
+  month: string;
+  monthlyUsd: number;
+  warn?: true;
+  cap?: true;
+}
+
+const ALERTS_FILE = "alerts.json";
+
+function readMarks(dataDir: string): AlertMarks | null {
+  try {
+    const value: unknown = JSON.parse(readFileSync(join(dataDir, "usage", ALERTS_FILE), "utf8"));
+    if (typeof value !== "object" || value === null) return null;
+    const marks = value as AlertMarks;
+    return typeof marks.month === "string" && typeof marks.monthlyUsd === "number" ? marks : null;
+  } catch {
+    return null;
+  }
+}
+
+export function takeSpendAlert(dataDir: string, state: SpendState | null): SpendAlert | null {
+  if (!state || (!state.warn && !state.exceeded)) return null;
+  const saved = readMarks(dataDir) ?? memoryMarks.get(dataDir) ?? null;
+  const marks: AlertMarks = saved && saved.month === state.month && saved.monthlyUsd === state.monthlyUsd
+    ? saved
+    : { month: state.month, monthlyUsd: state.monthlyUsd };
+  const alert: SpendAlert | null = state.exceeded && !marks.cap ? "cap" : state.warn && !marks.warn && !marks.cap ? "warn" : null;
+  if (!alert) return null;
+  const next: AlertMarks = { ...marks, warn: true, ...(alert === "cap" ? { cap: true as const } : {}) };
+  memoryMarks.set(dataDir, next);
+  try {
+    mkdirSync(join(dataDir, "usage"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dataDir, "usage", ALERTS_FILE), JSON.stringify(next), { mode: 0o600 });
+  } catch {
+  }
+  return alert;
+}
+const memoryMarks = new Map<string, AlertMarks>();
+
+export function resetSpendAlertsForTests(): void {
+  memoryMarks.clear();
+}
+
+export function spendAlertText(alert: SpendAlert, state: SpendState): { title: string; body: string } {
+  const spent = `$${state.spentUsd.toFixed(2)} of $${usd(state.monthlyUsd)} spent this month (${state.month})`;
+  return alert === "cap"
+    ? { title: "Monthly spend limit reached", body: `${spent}. New turns are refused until an admin raises the limit under Settings → Usage.` }
+    : { title: `Spend is at ${state.percent}% of the monthly limit`, body: `${spent}. New turns stop when the limit is reached.` };
 }

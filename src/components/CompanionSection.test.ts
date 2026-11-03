@@ -5,8 +5,8 @@ import {
   companionStateRefreshIsCurrent,
   mutateCompanionBridgeState,
   phonePairingManualCodeMode,
-  type CompanionState,
-} from "./PhoneSetupFlow";
+} from "../lib/companion-state";
+import type { CompanionState } from "./PhoneSetupFlow";
 import {
   companionAccountActionError,
   companionPairingMode,
@@ -182,8 +182,6 @@ describe("companion pairing availability", () => {
 
   it("allows pairing as soon as the hosted route is published", () => {
     expect(companionPairingMode(account("ready"), hostedCompanion)).toBe("hosted-ready");
-    // The companion endpoint is the source of truth even if the separately
-    // polled account state is one render behind.
     expect(companionPairingMode(account("connecting"), hostedCompanion)).toBe("hosted-ready");
   });
 
@@ -200,7 +198,7 @@ describe("Tailscale pairing onboarding", () => {
   it("keeps HTTPS as the recommended default surface", () => {
     expect(pairingSurfaceCopy({ localFallback: false, tailscaleFallback: false })).toEqual({
       title: "Secure HTTPS pairing",
-      subtitle: "Recommended — the simplest setup, and it keeps working when the paired device leaves this Wi-Fi.",
+      subtitle: "Recommended. The simplest setup, and it keeps working when the paired device leaves this Wi-Fi.",
     });
     expect(pairingSurfaceCopy({ localFallback: false, tailscaleFallback: true }).title).toBe(
       "Tailscale pairing",

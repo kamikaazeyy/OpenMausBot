@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Check, Copy, Download, Share } from "lucide-react";
 
 import { cn } from "@/lib/cn";
+import { useMenuMotion } from "./MenuMotion";
 import {
   copyTranscriptToClipboard,
   downloadMarkdownTranscript,
@@ -9,24 +10,16 @@ import {
   slugifyTranscriptFilename,
 } from "@/lib/export-transcript";
 import type { Message } from "@/state/store";
+import { MENU_HEADING, MENU_SHEET } from "./menu-recipe";
 
 export interface ExportTranscriptMenuProps {
-  /** Title of the conversation (bot name or channel name). */
   title: string;
-  /** Messages to export. */
   messages: readonly Message[];
-  /** Optional fallback bot name for 1:1 chats. */
   botName?: string;
-  /** Whether this is a group room / channel. */
   isGroup?: boolean;
-  /** Optional custom CSS classes for the trigger button. */
   className?: string;
 }
 
-/**
- * A dropdown menu button in the chat header allowing users to export the current
- * conversation transcript either by copying to clipboard or downloading as Markdown.
- */
 export function ExportTranscriptMenu({
   title,
   messages,
@@ -35,6 +28,7 @@ export function ExportTranscriptMenu({
   className,
 }: ExportTranscriptMenuProps) {
   const [open, setOpen] = useState(false);
+  const motion = useMenuMotion(open);
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -69,7 +63,6 @@ export function ExportTranscriptMenu({
 
   const hasMessages = messages && messages.length > 0;
 
-  /** Copy formatted Markdown transcript to clipboard with visual feedback. */
   const handleCopy = async () => {
     if (!hasMessages) return;
     const markdown = formatTranscriptMarkdown({
@@ -87,7 +80,6 @@ export function ExportTranscriptMenu({
     }
   };
 
-  /** Trigger browser download for the formatted Markdown transcript file. */
   const handleDownload = () => {
     if (!hasMessages) return;
     const markdown = formatTranscriptMarkdown({
@@ -110,7 +102,7 @@ export function ExportTranscriptMenu({
         aria-haspopup="menu"
         aria-expanded={open}
         className={cn(
-          "rounded-md p-1.5 transition-colors hover:bg-raised",
+          "flex size-8 items-center justify-center rounded-full transition-colors hover:bg-ink/[0.06]",
           open ? "text-accent" : "text-ink-secondary hover:text-ink",
           className,
         )}
@@ -119,18 +111,18 @@ export function ExportTranscriptMenu({
         <Share size={18} />
       </button>
 
-      {open && (
+      {motion.shown && (
         <div
           role="menu"
           aria-label="Export options"
-          className="absolute right-0 top-full z-40 mt-1 w-[220px] overflow-hidden rounded-xl border border-hairline/50 bg-card py-1.5 shadow-2xl shadow-black/50"
+          className={cn("absolute right-0 top-full z-40 mt-1 w-[220px] overflow-hidden", MENU_SHEET, motion.className)} {...motion.exitProps}
         >
-          <div className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wider text-ink-secondary/70">
+          <div className={MENU_HEADING}>
             Export Conversation
           </div>
 
           {!hasMessages ? (
-            <div className="px-3 py-2 text-[12px] text-ink-secondary">
+            <div className="px-2 py-1.5 text-[12px] text-ink-secondary">
               No messages to export yet.
             </div>
           ) : (
@@ -139,12 +131,12 @@ export function ExportTranscriptMenu({
                 type="button"
                 role="menuitem"
                 onClick={() => void handleCopy()}
-                className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-[13px] text-ink hover:bg-raised/70"
+                className="ui-menu-row text-ink"
               >
                 {copied ? (
-                  <Check size={14} className="shrink-0 text-success" />
+                  <Check size={16} className="shrink-0 text-success" />
                 ) : (
-                  <Copy size={14} className="shrink-0 text-ink-secondary" />
+                  <Copy size={16} className="shrink-0 text-ink-secondary" />
                 )}
                 <span className="flex-1 truncate">
                   {copied ? "Copied to clipboard!" : "Copy as Markdown"}
@@ -152,7 +144,7 @@ export function ExportTranscriptMenu({
               </button>
 
               {copyFailed && (
-                <div role="status" className="px-3 py-2 text-[12px] text-ink-secondary">
+                <div role="status" className="px-2 py-1.5 text-[12px] text-ink-secondary">
                   Clipboard unavailable. Download the Markdown file instead.
                 </div>
               )}
@@ -161,9 +153,9 @@ export function ExportTranscriptMenu({
                 type="button"
                 role="menuitem"
                 onClick={handleDownload}
-                className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-[13px] text-ink hover:bg-raised/70"
+                className="ui-menu-row text-ink"
               >
-                <Download size={14} className="shrink-0 text-ink-secondary" />
+                <Download size={16} className="shrink-0 text-ink-secondary" />
                 <span className="flex-1 truncate">Download as .md</span>
               </button>
             </>

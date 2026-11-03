@@ -10,15 +10,14 @@ Open the printed `previewUrl` in a browser or an isolated Electron window.
 The fixture starts the standard fake-engine harness in a temporary home,
 creates its own test bot through the mapped control command, and mounts the
 real `ComputerPanel`. Only the cloud transport is simulated. It never needs
-a Box API key and never contacts a cloud provider. Ctrl-C stops both servers
+a Boat API key and never contacts a cloud provider. Ctrl-C stops both servers
 and removes their temporary data; the printed harness log remains.
 
 Verify these transitions with computer use:
 
-1. On initial connection, **Cloud screen connected** appears. The fixture
-   deliberately injects an old blank SSE frame before mounting the connection;
-   that frame must not hide the new screenshot. The old implementation fails
-   this check by continuing to display a black rectangle.
+1. On initial connection, **Cloud screen connected** appears. The panel hears
+   live frames only while its preview is up, so a frame sent before it
+   connected cannot hide this screenshot.
 2. Select **corrupt**, then **Reconnect panel**. The panel must show an image
    error and **Retry preview**, rather than a blank image with an Open button.
 3. Select **slow**, then **Retry preview**. The panel immediately shows
@@ -30,7 +29,7 @@ Verify these transitions with computer use:
    **Cloud screen connected**, even though the bot is still busy.
 6. Turn **Busy** on, then **Reconnect panel**. The fixture, like the server,
    refuses `provision` with 409 while a turn is active. The panel must still
-   connect and show the screen (it attaches to the ready box without
+   connect and show the screen (it attaches to the ready boat without
    provisioning) — not **Couldn't reach the computer** with a red
    "being used by an active turn" alert. Turn **Busy** off: the panel stays
    connected.
@@ -56,6 +55,17 @@ Verify these transitions with computer use:
     **Panel → Remote desktop**. The viewer is simulated, never a native window.
 12. Select **unconfigured** while **Busy** is on. Its permanent HTTP409 must
     show **VPS is not configured** with Retry, not an endless connecting state.
+13. Focus the tab row with **Tab**: **Left**/**Right** and **Home**/**End**
+    move between tabs, the vertical arrows must leave the page's scrolling
+    alone, and the focused tab's ring must not be clipped by the row. Press
+    **Tab** again: focus lands on the selected panel itself before its first
+    control.
+14. Close the panel with **Enter** on its focused X, then open it again with
+    **Enter** on **Open computer panel**: the Computer panel focuses its active
+    tab, the **Remote desktop** panel focuses its own X, and closing either
+    returns focus to that opener button. By hand, a pointer click on the opener
+    must leave focus out of the panel entirely; the chat header's own button
+    covers that in the computer panel focus recipe.
 
 The automated browser regression runs these contention, cancellation, decoded
 frame retention, and join-pause checks against the same fixture:
@@ -71,6 +81,6 @@ and persistent server log. To reuse already installed test binaries, set
 The fixture tests actual image decoding, request cancellation, fresh frame
 selection, and renderer feedback. Host work continuing after cancellation is
 simulated in-page; `server/vps-routing.test.ts` separately covers the real HTTP
-route with fake SSH/Docker. Neither fixture proves a real VPS connection, Box
+route with fake SSH/Docker. Neither fixture proves a real VPS connection, Boat
 provisioning, native viewer windows, or account authentication. Test those
 separately with an explicitly isolated provider fixture when changing those paths.

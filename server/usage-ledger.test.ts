@@ -53,6 +53,27 @@ describe("usage ledger files", () => {
     const rows = readUsage(dataDir, { from: new Date("2026-09-01T00:00:00Z"), to: new Date("2026-10-31T23:59:59Z") });
     expect(rows.map((r) => r.botId)).toEqual(["b1", "b2", "b3"]);
     expect(rows[1]!.costUsd).toBeNull();
+    expect(rows[0]!.costSource).toBe("reported");
+    expect(rows[1]).not.toHaveProperty("costSource");
+  });
+
+  it("carries the prompt byte split when present and drops malformed values", async () => {
+    appendUsage(dataDir, row({ at: "2026-09-03T10:00:00.000Z", promptBytes: { stable: 21_396, volatile: 8_102 } }));
+    appendUsage(dataDir, row({ at: "2026-09-03T11:00:00.000Z", promptBytes: { stable: -4, volatile: "big" } as unknown as { stable: number; volatile: number } }));
+    await flushUsageLedger(dataDir);
+    const rows = readUsage(dataDir, { from: new Date("2026-09-01T00:00:00Z"), to: new Date("2026-09-30T23:59:59Z") });
+    expect(rows[0]!.promptBytes).toEqual({ stable: 21_396, volatile: 8_102 });
+    expect(rows[1]).not.toHaveProperty("promptBytes");
+  });
+
+  it("stores an estimate as such, and drops a label that has no cost behind it", async () => {
+    appendUsage(dataDir, row({ at: "2026-09-03T10:00:00.000Z", costUsd: 0.25, costSource: "estimated" }));
+    appendUsage(dataDir, row({ at: "2026-09-03T11:00:00.000Z", costUsd: null, costSource: "estimated" }));
+    await flushUsageLedger(dataDir);
+    const rows = readUsage(dataDir, { from: new Date("2026-09-01T00:00:00Z"), to: new Date("2026-09-30T23:59:59Z") });
+    expect(rows[0]).toMatchObject({ costUsd: 0.25, costSource: "estimated" });
+    expect(rows[1]!.costUsd).toBeNull();
+    expect(rows[1]).not.toHaveProperty("costSource");
   });
 
   it("filters by time, skips torn lines and foreign rows, and never stores a negative or fractional token", async () => {
@@ -125,6 +146,15 @@ describe("usage summaries", () => {
     expect(summarizeUsage([], "day")).toEqual({ groups: [], total: expect.objectContaining({ turns: 0, costUsd: null }) });
   });
 
+  it("groups by routine, with every non-routine turn in one manual bucket", () => {
+    const summary = summarizeUsage(rows, "routine");
+    expect(summary.groups.map((g) => [g.key, g.label, g.turns, g.costUsd])).toEqual([
+      ["routine:r1", "Morning digest", 1, 0.5],
+      ["manual", "Not from a routine", 3, expect.closeTo(0.013, 6)],
+    ]);
+    expect(summary.total.turns).toBe(4);
+  });
+
   it("prices groups from the operator's list and adds a billable column to the CSV only then", () => {
     const prices = { default: { inputPerMillion: 1000, outputPerMillion: 2000 }, "codex/gpt-5": { inputPerMillion: 0, outputPerMillion: 0 } };
     const priced = summarizeUsage(rows, "bot", prices);
@@ -134,9 +164,29 @@ describe("usage summaries", () => {
     expect(priced.groups[1]!.billableUsd).toBeCloseTo((1200 * 1000 + 300 * 2000) / 1e6, 9);
     expect(priced.total.billableUsd).toBeCloseTo(priced.groups[0]!.billableUsd! + priced.groups[1]!.billableUsd!, 9);
     expect(summarizeUsage(rows, "bot").total.billableUsd).toBeNull();
-    expect(usageCsv([rows[0]!], prices).split("\n")[0]).toContain(",cost_usd,billable_usd,thread");
-    expect(usageCsv([rows[0]!], prices).split("\n")[1]).toContain(",0.012,1.8,t1");
+    expect(usageCsv([rows[0]!], prices).split("\n")[0]).toContain(",cost_usd,cost_source,billable_usd,thread");
+    expect(usageCsv([rows[0]!], prices).split("\n")[1]).toContain(",0.012,reported,1.8,t1");
     expect(usageCsv([rows[0]!]).split("\n")[0]).not.toContain("billable_usd");
+  });
+
+  it("groups by department as booked, and counts a routine's or a teammate's work for a person as theirs", () => {
+    const booked: UsageRow[] = [
+      { ...rows[0]!, section: "Finance" },
+      { ...rows[2]!, section: "Finance", trigger: { kind: "routine", routineId: "r1", label: "Morning digest", email: "ada@example.test" } },
+      { ...rows[3]!, trigger: { kind: "bot", botId: "b1", email: "bob@example.test" } },
+      rows[1]!,
+    ];
+    expect(summarizeUsage(booked, "department").groups.map((g) => [g.key, g.label, g.turns])).toEqual([
+      ["department:Finance", "Finance", 2],
+      ["department:", "", 2],
+    ]);
+    expect(summarizeUsage(booked, "user").groups.map((g) => [g.key, g.turns])).toEqual([
+      ["user:ada@example.test", 2],
+      ["user:bob@example.test", 1],
+      ["owner", 1],
+    ]);
+    expect(summarizeUsage(booked, "routine").groups[0]).toMatchObject({ key: "routine:r1", turns: 1 });
+    expect(usageCsv([booked[1]!]).split("\n")[1]).toMatch(/,Finance,ada@example\.test$/);
   });
 
   it("names a person by email before device label and never throws on an empty trigger", () => {
@@ -146,16 +196,47 @@ describe("usage summaries", () => {
     expect(triggerLabel({ kind: "routine" })).toBe("Routine: unknown");
   });
 
+  it("keeps helper-model calls in a group of their own, apart from bot-to-bot turns, and never as a routine", () => {
+    const helper: UsageRow = {
+      ...row({ botId: "b2", botName: "Clerk", threadId: "memory-1", instanceId: "claude", driverKind: "claudeAgent", model: "claude-haiku-4-5", costUsd: 0.002, trigger: { kind: "helper", botId: "b2", job: "memory" } }),
+      at: "2026-09-02T11:00:00.000Z",
+    };
+    expect(triggerKey(helper.trigger)).toBe("helper");
+    expect(triggerLabel(helper.trigger)).toBe("Helper model");
+    const byPerson = summarizeUsage([...rows, helper], "user").groups;
+    expect(byPerson.find((group) => group.key === "helper")).toMatchObject({ label: "Helper model", turns: 1, costUsd: 0.002 });
+    expect(byPerson.find((group) => group.key === "bot")).toMatchObject({ label: "Bot to bot", turns: 1, costUsd: 0.001 });
+    // still the bot's spend, on the helper's engine, and not a routine's
+    expect(summarizeUsage([helper], "bot").groups.map((group) => group.label)).toEqual(["Clerk"]);
+    expect(summarizeUsage([helper], "engine").groups.map((group) => group.label)).toEqual(["claudeAgent"]);
+    expect(summarizeUsage([helper], "routine").groups.map((group) => group.key)).toEqual(["manual"]);
+    expect(usageCsv([helper]).split("\n")[1]).toBe("2026-09-02T11:00:00.000Z,Clerk,claude-haiku-4-5,claudeAgent,Helper model,1200,300,900,0.002,reported,memory-1,,");
+  });
+
   it("exports spreadsheet-safe CSV with one line per turn", () => {
     const csv = usageCsv([
       rows[0]!,
       { ...rows[1]!, botName: '=HYPERLINK("x")', trigger: { kind: "user", email: "a,b@example.test" } },
     ]);
     const lines = csv.trim().split("\n");
-    expect(lines[0]).toBe("time,bot,model,engine,triggered_by,input_tokens,output_tokens,cached_input_tokens,cost_usd,thread");
-    expect(lines[1]).toBe("2026-09-01T10:00:00.000Z,Scout,claude-sonnet-5,claudeAgent,ada@example.test,1200,300,900,0.012,t1");
+    expect(lines[0]).toBe("time,bot,model,engine,triggered_by,input_tokens,output_tokens,cached_input_tokens,cost_usd,cost_source,thread,department,person");
+    expect(lines[1]).toBe("2026-09-01T10:00:00.000Z,Scout,claude-sonnet-5,claudeAgent,ada@example.test,1200,300,900,0.012,reported,t1,,ada@example.test");
     expect(lines[2]).toContain("\"'=HYPERLINK(\"\"x\"\")\"");
     expect(lines[2]).toContain('"a,b@example.test"');
-    expect(lines[2]).toMatch(/,,t1$/);
+    expect(lines[2]).toMatch(/,,,t1,,"a,b@example.test"$/);
+    expect(usageCsv([{ ...rows[0]!, costSource: "estimated" }]).split("\n")[1]).toContain(",0.012,estimated,t1");
+  });
+
+  it("keeps estimates apart from reported cost, and reads rows written before estimates existed as reported", () => {
+    const estimated = { ...rows[1]!, costUsd: 0.2, costSource: "estimated" as const };
+    const legacy = { ...rows[0]! }; // costUsd 0.012, no costSource
+    const summary = summarizeUsage([legacy, estimated, rows[2]!], "bot");
+    expect(summary.total.costUsd).toBeCloseTo(0.712, 9);
+    expect(summary.total.estimatedUsd).toBeCloseTo(0.2, 9);
+    expect(summary.total.unpriced).toBe(0);
+    const clerk = summary.groups.find((g) => g.label === "Clerk")!;
+    expect(clerk).toMatchObject({ costUsd: 0.2, estimatedUsd: 0.2 });
+    expect(summary.groups.find((g) => g.label === "Scout")!.estimatedUsd).toBeNull();
+    expect(summarizeUsage([rows[1]!], "bot").total).toMatchObject({ costUsd: null, estimatedUsd: null, unpriced: 1 });
   });
 });

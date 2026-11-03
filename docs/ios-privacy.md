@@ -48,8 +48,18 @@ account. A user may separately sign in on the desktop to enable the optional
   process IP addresses and connection/request metadata as OpenMausBot's service
   provider under Cloudflare's privacy terms.
 - Connector tokens stay in the desktop operating system's encrypted credential
-  store. Pairing and device tokens are not stored in the hosted control-plane
-  database.
+  store. Pairing tokens and the phone's device credential are not stored in
+  the hosted control-plane database.
+- Closed-app alerts: when the phone allows notifications, the app gives its
+  paired computer the Apple Push Notification service device token for this
+  app install. A computer with optional hosted access registers that token
+  with the OpenMausBot control plane, which stores it with the installation
+  ID, the APNs environment and timestamps so it can ask Apple to deliver an
+  alert. An alert carries only its kind, the bot's and room's names and
+  opaque IDs; never message text, replies, file paths or secrets. Apple
+  processes the token and alert under its own terms. The token is deleted
+  when the phone is unpaired or removes the computer, when Apple reports it
+  invalid, and when the computer's hosted access is revoked.
 - When a user explicitly chooses OpenMausBot from another app's Share sheet, or
   uses the attachment button in a chat, the selected text, link, image, or
   supported document is sent to the bot or room the user confirms. Images and
@@ -58,6 +68,9 @@ account. A user may separately sign in on the desktop to enable the optional
   limited to 10 MiB, documents to 25 MiB, and one message to four items and
   50 MiB total. The computer refuses new uploads after 512 MiB of attachments
   rather than silently deleting files referenced by older conversations.
+  Voice notes an agent sends are mp3 files in that same attachments directory
+  with generated names and the same owner-only permissions, and they count
+  against the same 512 MiB quota.
   In-chat selections remain in memory until the message succeeds or the draft
   is discarded. Temporary Share-extension copies are removed after a completed
   send or cancellation. If iOS terminates the extension mid-transfer, the next

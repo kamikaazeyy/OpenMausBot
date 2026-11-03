@@ -1,32 +1,30 @@
-// propose_profile: a bot proposes changes to its own name, title, description,
-// SOUL.md, or working folder; confirmed cards and Full Access submissions share
-// the same validated commit path. Same
-// shape as routine-requests.ts, much smaller: the profile commits in one
-// store call, and staleness is a hash of the five fields instead of a
-// scheduler revision. Everything here is re-validated at confirm time —
-// a card can sit open for days.
-import { lineDiff } from "../shared/line-diff.ts";
+// propose_profile applies at once with an Undo. The owner's card (direct-apply.ts) is re-validated at confirm time, since it can sit open for days.
+import { soulDiffLines } from "../shared/line-diff.ts";
 import { BOT_PROFILE_LIMITS } from "../shared/bot-profile.ts";
 import { PROFILE_REQUEST_FIELDS, type ProfileRequestCardData, type ProfileRequestChanges } from "../shared/profile-request.ts";
 import { parseBotProfilePatch, type BotProfilePatchInput } from "./bot-profile.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
 import { newId } from "./contracts.ts";
+import { UNDO_STALE, type DirectApply, type DirectApplyCheck } from "./direct-apply.ts";
 import { profileRevision, profileSnapshot } from "./profile-revision.ts";
 import { recordProfileChange } from "./profile-versions.ts";
 import { redactSecretsInText } from "./redact.ts";
 import type { BotRecord } from "./store.ts";
 
 const MAX_REASON = 500;
-const MAX_DIFF_LINES = 400;
 const STALE = "This bot's profile changed after this card was prepared. Ask the bot to review it and propose again.";
 const NO_SUCH_BOT = "That bot no longer exists";
 const LABELS: Record<Exclude<(typeof PROFILE_REQUEST_FIELDS)[number], "soul" | "cwd">, string> = {
   name: "Name",
   title: "Title",
   description: "Description",
+  notifications: "Notifications",
+  speakReplies: "Speak replies",
 };
 const PRIVATE_WORKSPACE = "its private workspace";
-const CHOOSE_ONE = "Choose at least one of name, title, description, soul, cwd";
+const CHOOSE_ONE = "Choose at least one of name, title, description, soul, cwd, notifications, speakReplies";
+const toggleText = (value: boolean | undefined): string => (value ? "on" : "off");
+const TEXT_FIELDS = ["name", "title", "description", "soul"] as const;
 
 export interface OptionCardLike {
   title: string;
@@ -34,13 +32,15 @@ export interface OptionCardLike {
   options: string[];
   answered?: string;
   dismissed?: boolean;
+  expired?: boolean;
   requestId?: string;
   tool?: string;
   held?: string;
+  autoApplied?: boolean;
+  undone?: boolean;
   profileRequest?: ProfileRequestCardData;
 }
 
-/** Kept narrow so the domain can be tested without constructing the full app store. */
 export interface ProfileRequestStore {
   bot(id: string): BotRecord | undefined | null;
   messagesFor(threadId: string): Array<{ id: string; card?: OptionCardLike }>;
@@ -54,26 +54,28 @@ export interface ProfileRequestStore {
     },
   ): { id: string };
   patchMessage(threadId: string, messageId: string, patch: { card: OptionCardLike }): { id: string } | null;
-  patchBotProfile(id: string, patch: Partial<Pick<BotRecord, "name" | "title" | "description" | "cwd" | "soul" | "lastProfileRequestId">>): BotRecord | null;
+  patchBotProfile(id: string, patch: Partial<Pick<BotRecord, "name" | "title" | "description" | "cwd" | "soul" | "notifications" | "speakReplies" | "lastProfileRequestId">>): BotRecord | null;
 }
 
 export interface ProfileRequestServiceOptions {
   store: ProfileRequestStore;
   now?: () => number;
-  /** Server-owned effective mode of the source conversation, never request input. */
-  autoApply?: (botId: string, threadId: string) => boolean;
-  canPersist?: (botId: string, threadId: string) => { ok: true } | { ok: false; status: number; error: string };
+  /** Server-owned, never request input. */
+  autoApply?: DirectApplyCheck;
+  canPersist?: (botId: string, threadId: string, opensCard: boolean) => { ok: true } | { ok: false; status: number; error: string };
   /** Chief targeting another bot: returns a refusal sentence or null. Checked at propose AND confirm. */
   validateTarget?: (proposerBotId: string, targetBotId: string) => string | null;
 }
 
 export class ProfileRequestError extends Error {
   readonly status: number;
+  readonly terminal: boolean;
 
-  constructor(message: string, status = 400) {
+  constructor(message: string, status = 400, options?: { terminal?: boolean }) {
     super(message);
     this.name = "ProfileRequestError";
     this.status = status;
+    this.terminal = options?.terminal === true;
   }
 }
 
@@ -83,6 +85,12 @@ export type ResolveProfileRequestResult =
   | { claimed: true; state: "already_settled"; behavior: string }
   | { claimed: true; state: "denied" }
   | { claimed: true; state: "applied"; targetBotId: string; fields: string[]; settlementPending?: true; message?: string };
+
+export type UndoProfileRequestResult =
+  | { claimed: false }
+  | { claimed: true; state: "already_undone" }
+  | { claimed: true; state: "invalid"; error: string; status: number; stale?: true }
+  | { claimed: true; state: "undone"; targetBotId: string };
 
 interface ProfileCardCopy {
   title: string;
@@ -100,9 +108,7 @@ function reasonText(value: unknown): string {
   return redactSecretsInText(trimmed);
 }
 
-/** `parseBotProfilePatch` would silently accept a key like `notifications` —
- * valid for the broader bot patch, not for a profile request. Reject keys
- * outside the proposable fields ourselves first, for exact copy. */
+/** parseBotProfilePatch accepts keys (like `voice`) a profile request must not carry: reject them first. */
 function parseChanges(input: unknown): ProfileRequestChanges {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw new ProfileRequestError(CHOOSE_ONE);
@@ -116,10 +122,6 @@ function parseChanges(input: unknown): ProfileRequestChanges {
   if (keys.length === 0) {
     throw new ProfileRequestError(CHOOSE_ONE);
   }
-  // The working folder is not a profile-patch field (PATCH /api/bots checks
-  // it with validateBotCwd, not parseBotProfilePatch), so it is split off and
-  // checked the same way that route does: absolute, exists, is a folder.
-  // "" (or null) means the private workspace.
   const { cwd: rawCwd, ...profileInput } = input as Record<string, unknown>;
   let cwdChange: string | undefined;
   if (rawCwd !== undefined) {
@@ -136,14 +138,14 @@ function parseChanges(input: unknown): ProfileRequestChanges {
   for (const field of PROFILE_REQUEST_FIELDS) {
     if (field === "cwd") continue;
     const value = parsed.patch[field];
-    // This payload is hidden under the card's visible fields, so the store's
-    // shallow card redaction cannot reach it. Scrub before it is persisted.
+    if (field === "notifications" || field === "speakReplies") {
+      if (value !== undefined) changes[field] = value as boolean;
+      continue;
+    }
+    // Hidden under the card's visible fields, where the store's shallow card redaction cannot reach.
     if (typeof value !== "string") continue;
     const redacted = redactSecretsInText(value);
-    // A mask can be LONGER than the secret it replaces (e.g. an 8-char
-    // value becomes "«redacted 8 chars»"), so a value that passed the raw
-    // cap can come out the other side over it. Re-check with the exact
-    // copy the parser itself would have used.
+    // A redaction mask can be longer than the secret, so the cap is checked again after scrubbing.
     if (field === "soul") {
       if (Buffer.byteLength(redacted, "utf8") > BOT_PROFILE_LIMITS.soul) {
         throw new ProfileRequestError("standing instructions must be at most 24000 bytes");
@@ -166,10 +168,6 @@ export function profileCardCopy(
   changes: ProfileRequestChanges,
   reason: string,
 ): ProfileCardCopy {
-  // Whether this is a first-time setup is a property of the bot's WHOLE
-  // profile, not of the fields this particular proposal happens to touch —
-  // otherwise a name-only rename of an established bot reads as "Set up X?"
-  // just because title/description/soul never appear in `before`.
   const isSetup = !fullProfile.title && !fullProfile.description && !fullProfile.soul;
   const title = target.crossBot
     ? `Update @${target.name}'s profile?`
@@ -181,34 +179,21 @@ export function profileCardCopy(
   for (const field of PROFILE_REQUEST_FIELDS) {
     if (field === "soul" || field === "cwd") continue;
     if (changes[field] === undefined) continue;
+    if (field === "notifications" || field === "speakReplies") {
+      lines.push(`${LABELS[field]}: ${toggleText(before[field] as boolean | undefined)} → ${toggleText(changes[field] as boolean | undefined)}`);
+      continue;
+    }
     lines.push(`${LABELS[field]}: "${before[field] ?? ""}" → "${changes[field]}"`);
   }
   if (changes.cwd !== undefined) {
     lines.push(`Working folder: ${before.cwd || PRIVATE_WORKSPACE} → ${changes.cwd || PRIVATE_WORKSPACE}`);
   }
   if (changes.soul !== undefined) {
-    const beforeSoul = before.soul ?? "";
-    const afterSoul = changes.soul;
-    const bytesBefore = Buffer.byteLength(beforeSoul, "utf8");
-    const bytesAfter = Buffer.byteLength(afterSoul, "utf8");
-    lines.push(`SOUL.md (${bytesBefore} → ${bytesAfter} bytes):`);
-    const diff = lineDiff(beforeSoul, afterSoul);
-    if (diff.length > MAX_DIFF_LINES) {
-      // Truncating a diff can hide the very instructions being approved.
-      // The full replacement is already byte-bounded by profile validation
-      // and is readable in the same generic card on desktop and phones.
-      lines.push("Large change — complete proposed instructions (replaces the current SOUL.md):");
-      lines.push(afterSoul || "(empty)");
-    } else {
-      lines.push(...diff);
-    }
+    lines.push(...soulDiffLines(before.soul ?? "", changes.soul));
   }
-  // The closing line says the consequence of exactly what is on the card:
-  // a folder change moves where the bot's tools read and write; the other
-  // fields change what it is told. Either way nothing runs on confirm.
-  const onlyFolder = Object.keys(changes).every((field) => field === "cwd");
+  const changesText = TEXT_FIELDS.some((field) => changes[field] !== undefined);
   if (changes.cwd !== undefined) lines.push(`${target.name}'s tools will read and write files in that folder.`);
-  lines.push(onlyFolder ? "Nothing runs." : `Changes what ${target.name} is told on every turn. Nothing runs.`);
+  lines.push(changesText ? `Changes what ${target.name} is told on every turn. Nothing runs.` : "Nothing runs.");
   const detail = lines.join("\n");
 
   const fields = PROFILE_REQUEST_FIELDS.filter((field) => changes[field] !== undefined);
@@ -221,8 +206,6 @@ export class ProfileRequestService {
   private readonly now: () => number;
   private readonly canPersist?: ProfileRequestServiceOptions["canPersist"];
   private readonly autoApply?: ProfileRequestServiceOptions["autoApply"];
-  /** Public: a caller's section membership can change between propose and
-   * confirm, and tests flip this mid-scenario to model that. */
   validateTarget?: ProfileRequestServiceOptions["validateTarget"];
 
   constructor(options: ProfileRequestServiceOptions) {
@@ -252,6 +235,7 @@ export class ProfileRequestService {
   private prepare(args: Parameters<ProfileRequestService["propose"]>[0], submitted = false): {
     requestId: string; messageId: string; title: string; summary: string; detail: string;
     result?: Extract<ResolveProfileRequestResult, { state: "applied" }>;
+    appliedBy?: DirectApply;
   } {
     const reason = reasonText(args.reason);
     const changes = parseChanges(args.changes);
@@ -268,12 +252,20 @@ export class ProfileRequestService {
     const snapshot = profileSnapshot(target);
     const before: ProfileRequestChanges = {};
     const finalChanges: ProfileRequestChanges = {};
+    let exactBefore = true;
     for (const field of PROFILE_REQUEST_FIELDS) {
-      const value = changes[field];
-      if (value === undefined) continue;
-      if (value === snapshot[field]) continue;
-      before[field] = redactSecretsInText(snapshot[field]);
-      finalChanges[field] = value;
+      if (field === "notifications" || field === "speakReplies") {
+        const value = changes[field];
+        if (value === undefined || value === snapshot[field]) continue;
+        before[field] = snapshot[field];
+        finalChanges[field] = value;
+      } else {
+        const value = changes[field];
+        if (value === undefined || value === snapshot[field]) continue;
+        before[field] = redactSecretsInText(snapshot[field]);
+        if (before[field] !== snapshot[field]) exactBefore = false;
+        finalChanges[field] = value;
+      }
     }
     if (Object.keys(finalChanges).length === 0) {
       throw new ProfileRequestError("Nothing would change");
@@ -296,11 +288,12 @@ export class ProfileRequestService {
     };
 
     const copy = profileCardCopy({ name: targetName, crossBot }, snapshot, before, finalChanges, reason);
-    const persistence = this.canPersist?.(args.botId, args.threadId);
+    const grant = submitted ? this.autoApply?.(args.botId, args.threadId, targetBotId) ?? null : null;
+    const automatic = grant !== null;
+    const persistence = this.canPersist?.(args.botId, args.threadId, !automatic);
     if (persistence && !persistence.ok) {
       throw new ProfileRequestError(persistence.error, persistence.status);
     }
-    const automatic = submitted && this.autoApply?.(args.botId, args.threadId) === true;
     const messageInput: Parameters<ProfileRequestStore["appendMessage"]>[1] = {
       role: "bot",
       kind: "options",
@@ -318,15 +311,67 @@ export class ProfileRequestService {
     const message = this.store.appendMessage(args.threadId, messageInput);
     const proposal = { requestId, messageId: message.id, title: copy.title, summary: copy.summary, detail: copy.detail };
     if (!automatic) return proposal;
-    // The hidden receipt is persisted before the profile changes. The same
-    // validation and durable commit marker serve both automatic and human decisions.
+    // The hidden receipt is persisted before the profile changes.
     const result = this.resolve({ botId: args.botId, threadId: args.threadId, requestId, behavior: "allow" });
-    if (result.state === "applied") return { ...proposal, result };
+    if (result.state === "applied") {
+      if (!result.settlementPending) this.recordAutoApplied(args.threadId, message.id, targetBotId, exactBefore);
+      return { ...proposal, result, appliedBy: grant! };
+    }
     throw new ProfileRequestError(result.state === "invalid" ? result.error : "The profile change could not be applied", result.state === "invalid" ? result.status : 409);
   }
 
-  /** Claims a profile card even after it was settled, so a duplicate click
-   * never re-applies an already-applied change. */
+  private recordAutoApplied(threadId: string, messageId: string, targetBotId: string, exactBefore: boolean): void {
+    try {
+      const card = this.store.messagesFor(threadId).find((candidate) => candidate.id === messageId)?.card;
+      const target = this.store.bot(targetBotId);
+      if (!card?.profileRequest || !target) return;
+      this.store.patchMessage(threadId, messageId, {
+        card: {
+          ...card,
+          autoApplied: true,
+          profileRequest: { ...card.profileRequest, ...(exactBefore ? { undo: { appliedRevision: profileRevision(target) } } : {}) },
+        },
+      });
+    } catch {
+    }
+  }
+
+  undo(args: { botId: string; threadId: string; requestId: string }): UndoProfileRequestResult {
+    const message = this.store
+      .messagesFor(args.threadId)
+      .find((candidate) => candidate.card?.requestId === args.requestId && candidate.card.profileRequest);
+    const card = message?.card;
+    const payload = card?.profileRequest;
+    if (!message || !card || !payload) return { claimed: false };
+    if (card.undone) return { claimed: true, state: "already_undone" };
+    const cannot = (error: string, status = 409): UndoProfileRequestResult => ({ claimed: true, state: "invalid", error, status });
+    if (!card.autoApplied || card.answered !== "allow") return cannot("Only a change that applied on its own can be undone here.");
+    if (payload.botId !== args.botId || payload.threadId !== args.threadId) {
+      return cannot("This profile change belongs to another conversation", 403);
+    }
+    if (!payload.undo) return cannot("This change can't be undone here.");
+    const target = this.store.bot(payload.targetBotId);
+    if (!target || profileRevision(target) !== payload.undo.appliedRevision) {
+      return { claimed: true, state: "invalid", error: UNDO_STALE, status: 409, stale: true };
+    }
+    const { cwd, ...rest } = payload.before;
+    const patch: Parameters<ProfileRequestStore["patchBotProfile"]>[1] = {};
+    for (const field of PROFILE_REQUEST_FIELDS) {
+      if (field === "cwd" || payload.changes[field] === undefined) continue;
+      (patch as Record<string, unknown>)[field] = rest[field];
+    }
+    if (payload.changes.cwd !== undefined) {
+      const checked = validateBotCwd(cwd || null);
+      if (!checked.ok) return cannot(checked.error);
+      patch.cwd = checked.cwd ?? undefined;
+    }
+    if (!this.store.patchBotProfile(target.id, patch)) return cannot(NO_SUCH_BOT, 404);
+    recordProfileChange(target.id, "user", `undo:${message.id}`, payload.changes, payload.before);
+    this.store.patchMessage(args.threadId, message.id, { card: { ...card, undone: true } });
+    return { claimed: true, state: "undone", targetBotId: target.id };
+  }
+
+  /** Claims a card even after it settled, so a duplicate click never re-applies a change. */
   resolve(args: {
     botId: string;
     threadId: string;
@@ -353,8 +398,7 @@ export class ProfileRequestService {
 
     try {
       const target = this.store.bot(payload.targetBotId);
-      // The profile and receipt share one durable write. If saving the card
-      // failed afterward, a retry only settles it; it never reapplies fields.
+      // Profile and receipt share one write: a retry after a failed card save only settles it.
       if (target?.lastProfileRequestId === payload.requestId) {
         const settled = this.store.patchMessage(args.threadId, message.id, {
           card: { ...card, answered: "allow", held: undefined, profileRequest: { ...payload, appliedAt: payload.appliedAt ?? this.now() } },
@@ -362,29 +406,29 @@ export class ProfileRequestService {
         if (!settled) throw new ProfileRequestError("This profile confirmation card is no longer available", 409);
         return { claimed: true, state: "already_settled", behavior: "allow" };
       }
+      if (card.expired) {
+        return { claimed: true, state: "invalid", error: "This profile request expired before it was confirmed. Ask for a fresh proposal.", status: 409 };
+      }
       if (args.behavior === "deny") {
         this.store.patchMessage(args.threadId, message.id, { card: { ...card, answered: "deny", held: undefined } });
         return { claimed: true, state: "denied" };
       }
-      if (!target) throw new ProfileRequestError(NO_SUCH_BOT, 404);
+      if (!target) throw new ProfileRequestError(NO_SUCH_BOT, 404, { terminal: true });
       const crossBot = payload.targetBotId !== payload.botId;
       if (crossBot && this.validateTarget) {
         const refusal = this.validateTarget(payload.botId, payload.targetBotId);
-        if (refusal) throw new ProfileRequestError(refusal, 404);
+        if (refusal) throw new ProfileRequestError(refusal, 404, { terminal: true });
       }
       if (profileRevision(target) !== payload.expectedRevision) {
-        throw new ProfileRequestError(STALE, 409);
+        throw new ProfileRequestError(STALE, 409, { terminal: true });
       }
 
       const { cwd, ...rest } = payload.changes;
       const validated = Object.keys(rest).length ? parseChanges(rest) : {};
       const patch: Parameters<ProfileRequestStore["patchBotProfile"]>[1] = { ...validated, lastProfileRequestId: payload.requestId };
       if (cwd !== undefined) {
-        // Re-checked at confirm: a card can sit open for days and the folder
-        // may be gone by then. 409 like the stale case — the card is no longer
-        // applicable as prepared.
         const checked = validateBotCwd(cwd || null);
-        if (!checked.ok) throw new ProfileRequestError(checked.error, 409);
+        if (!checked.ok) throw new ProfileRequestError(checked.error, 409, { terminal: true });
         patch.cwd = checked.cwd ?? undefined;
       }
       if (!this.store.patchBotProfile(target.id, patch)) throw new ProfileRequestError(NO_SUCH_BOT, 404);
@@ -401,14 +445,15 @@ export class ProfileRequestService {
       const status = error instanceof ProfileRequestError ? error.status : 400;
       const detail = error instanceof Error ? error.message : String(error);
       const saved = this.store.bot(payload.targetBotId)?.lastProfileRequestId === payload.requestId;
+      const expired = !saved && error instanceof ProfileRequestError && error.terminal;
       const notice = card.dismissed && card.options.length === 0
         ? "Profile saved. Recording the operation receipt could not finish; the changes will not be applied again."
         : "Profile saved. Confirm again to finish recording this decision; the changes will not be applied again.";
       try {
         this.store.patchMessage(args.threadId, message.id, {
-          card: { ...card, held: saved ? notice : redactSecretsInText(detail).slice(0, 500) },
+          card: { ...card, ...(expired ? { expired: true, options: [] } : {}), held: saved ? notice : redactSecretsInText(detail).slice(0, 500) },
         });
-      } catch { /* The durable profile receipt still permits a safe retry. */ }
+      } catch {}
       if (saved) return {
         claimed: true, state: "applied", targetBotId: payload.targetBotId,
         fields: PROFILE_REQUEST_FIELDS.filter((field) => payload.changes[field] !== undefined),

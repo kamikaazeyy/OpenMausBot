@@ -1,293 +1,136 @@
-// Carries out one agents tool: checks the arguments, applies the per-turn
-// guards, calls the harness, and turns the answer into the text the model
-// reads. One core for every front end, so a tool validates, refuses and
-// teaches the same way however it was reached; the stdio MCP proxy
-// (agents-proxy.ts) is the only front end today.
-//
-// Nothing here reads the environment or holds state of its own. The caller
-// passes a ToolCallContext, and the per-turn counters live on it.
+// Runs one agents tool: check arguments, call the harness, render the model's text. Stateless;
+// per-turn limits are the harness's, since one proxy can serve many turns of a warm engine.
+import { agentsCallMember, resolveAgentsCall } from "../../shared/agents-tool-names.ts";
 import { CREDENTIAL_TARGETS, isCredentialTargetId } from "../../shared/credential-request.ts";
-import { normalizeCronSchedule } from "../../shared/routine-schedule.ts";
 
 import { peerName } from "../peer-roster.ts";
-import { catalogProfileFromEnv, SHARED_COMPUTER_TOOL_NAMES, WEEKDAYS } from "./agents-catalog.ts";
+import { callCardTool, CARD_TOOL_NAMES } from "./agents-call-cards.ts";
+import { callTriggerTool, TRIGGER_TOOL_NAMES } from "./agents-call-triggers.ts";
+import { catalogProfileFromEnv, fullInputSchema, SHARED_COMPUTER_TOOL_NAMES } from "./agents-catalog.ts";
 import { harnessClientFromEnv } from "./agents-client.ts";
 import type { HarnessClient, Json } from "./agents-client.ts";
+import { memorySearchText } from "./memory-search-text.ts";
 import { boundedAgentResult } from "./agents-result.ts";
-
-/** Counters for the guards that refuse without a round trip. One context
- * serves one turn: the harness spawns a proxy per turn, so "this turn" and
- * "this process" are the same thing there. */
-export interface TurnGuards {
-  createdThisTurn: number;
-  roomPostsThisTurn: number;
-  threadsOpenedThisTurn: number;
-  memoryRefusalsThisTurn: number;
-  /** Delegations made in this turn: their ids may not be checked or waited
-   * on until a later one. */
-  delegationTaskIdsThisTurn: Set<string>;
-}
+import { outOfBounds } from "./agents-schema.ts";
+import { callResearchTool, RESEARCH_TOOL_NAMES } from "./agents-research-tools.ts";
+import { callHelperTool, HELPER_TOOL_NAMES } from "./agents-helper-tools.ts";
+import { callUsageLimitsTool, USAGE_LIMITS_TOOL } from "./agents-usage-tool.ts";
+import { callWaitTool, WAIT_TOOL_NAMES } from "./agents-wait-tools.ts";
+import { callComputerAskTool, COMPUTER_ASK_TOOL_NAMES } from "./agents-computer-ask-tool.ts";
+import { callMausBotTool, MAUSBOT_TOOL_NAMES } from "./agents-mausbot-tools.ts";
+import { callPageTool, PAGE_TOOL_NAMES } from "./agents-pages-tools.ts";
+import { callPersonTool, PERSON_TOOL_NAMES } from "./agents-person-tools.ts";
+import { callDevsTool, DEVS_TOOL_NAMES } from "./agents-devs-tools.ts";
 
 export interface ToolCallContext {
-  /** The calling bot's id (excluded from list_bots; the sender). */
   botId: string;
   threadId: string;
-  /** This turn's comms depth (the harness refuses recursion). */
   depth: number;
-  // Presentation only: the server still authenticates and scopes every call.
+  /** A standing external runtime: its capability cannot reach the result cache, so big results are cut. */
   externalRuntime: boolean;
-  coordinating: boolean;
+  // Presentation only: the server still authenticates and scopes every call.
   sharedComputers: boolean;
   client: HarnessClient;
-  turn: TurnGuards;
 }
 
 export interface ToolCallResult {
   text: string;
   isError?: boolean;
-  /** The harness answered with a finished MCP tools/call result (a shared
-   * computer's screenshot, say). A front end forwards it as it stands. */
   passthrough?: Json;
 }
 
-/** The context a spawned proxy was given, with a fresh set of turn guards:
- *   OMB_BOT_ID, OMB_THREAD_ID, OMB_TURN_DEPTH, plus the catalog switches
- *   (agents-catalog.ts) and the harness address and token (agents-client.ts). */
 export function toolCallContextFromEnv(env: NodeJS.ProcessEnv): ToolCallContext {
   const profile = catalogProfileFromEnv(env);
   return {
     botId: profile.botId,
     threadId: env.OMB_THREAD_ID ?? "",
     depth: Number(env.OMB_TURN_DEPTH ?? "0") || 0,
-    externalRuntime: profile.externalRuntime,
-    coordinating: profile.coordinating,
+    externalRuntime: env.OMB_EXTERNAL_RUNTIME === "1",
     sharedComputers: profile.sharedComputers,
     client: harnessClientFromEnv(env),
-    turn: {
-      createdThisTurn: 0,
-      roomPostsThisTurn: 0,
-      threadsOpenedThisTurn: 0,
-      memoryRefusalsThisTurn: 0,
-      delegationTaskIdsThisTurn: new Set<string>(),
-    },
   };
 }
 
-const EXTERNAL_STATUS_GUIDANCE = "Use check_delegation or wait_delegation with this task id to retrieve the result; polling is allowed without ending this external runtime.";
-const MAX_CREATED_PER_TURN = 4;
-// Same spirit as MAX_CREATED_PER_TURN above and MAX_QUEUED_PER_THREAD in
-// delegations.ts: one turn's worth of a good idea is a handful, and a turn
-// that wants more than that has stopped reporting and started broadcasting.
-// The harness enforces its own per-room budget regardless; this one exists
-// so the refusal reaches the model without a round trip.
-const MAX_ROOM_POSTS_PER_TURN = 3;
-// A thread is a real turn with its own run. Five in one turn is a plan
-// ("one per pull request"); more than that is a model that has stopped
-// deciding. The harness holds the same ceiling; this copy exists so the
-// refusal reaches the model without a round trip.
-const MAX_THREADS_PER_TURN = 5;
-// A memory write the harness refused (a stale passage, a full file) needs
-// one re-read and one corrected retry, not a loop of the same append. The
-// third refusal in a turn closes the tool so the turn ends with the person
-// told what did not fit instead of a transcript of retries.
-const MAX_MEMORY_REFUSALS_PER_TURN = 3;
+const SIGN_IN_PLACES: Record<string, string> = {
+  browser: "your built-in browser",
+  local: "this computer",
+  vm: "the Local VM",
+  cloud: "the cloud computer",
+};
 
-const SHORT_WEEKDAYS = {
-  mon: "monday",
-  tue: "tuesday",
-  tues: "tuesday",
-  wed: "wednesday",
-  thu: "thursday",
-  thur: "thursday",
-  thurs: "thursday",
-  fri: "friday",
-  sat: "saturday",
-  sun: "sunday",
-} as const satisfies Record<string, (typeof WEEKDAYS)[number]>;
+const STATUS_WORDS: Record<string, string> = {
+  queued: "queued, not started yet",
+  running: "running",
+  needs_input: "waiting on the person",
+  waiting: "waiting on its own hand-offs",
+  resume: "wrapping up (its hand-offs settled)",
+  completed: "completed",
+  failed: "failed",
+  cancelled: "cancelled",
+};
+const RESULT_HEAD = 2_000;
 
-const SUPPORTED_SCHEDULES =
-  'Supported schedules: {"type":"once","at":"2026-09-01T09:00:00+05:30"} (future RFC3339 with explicit offset), ' +
-  '{"type":"weekly","time":"09:00","weekdays":["monday","friday"]}, {"type":"daily","time":"09:00"}, ' +
-  '{"type":"interval","every_minutes":15,"weekdays":["monday","friday"],"window_start":"09:00","window_end":"17:00"}, ' +
-  'or {"type":"cron","expression":"0 9 1 * *","timeZone":"Asia/Kolkata"} (monthly at 09:00 on day 1; five fields and an explicit IANA timezone).';
-
-/** The outcome of coercing a model-sent schedule: the harness-dialect
- * schedule, or a message telling the model exactly what to send instead. */
-interface NormalizedSchedule {
-  schedule?: Json;
-  error?: string;
+function assignmentLine(a: Json): string {
+  const id = typeof a.id === "string" && a.id ? a.id : "?";
+  const who = typeof a.botName === "string" && a.botName ? `@${peerName(a.botName)}`
+    : typeof a.botId === "string" && a.botId ? a.botId : "a teammate";
+  const status = String(a.status ?? "unknown");
+  const outcome = typeof a.outcome === "string" && a.outcome && a.outcome !== "done" && a.outcome !== status ? ` (${a.outcome})` : "";
+  const detail = typeof a.outcomeDetail === "string" && a.outcomeDetail.trim() ? `: ${a.outcomeDetail.trim()}` : "";
+  return `${id} → ${who}: ${STATUS_WORDS[status] ?? status}${outcome}${detail}`;
 }
 
-/** A schedule as the harness accepts it, or a message telling the model
- * exactly what to send instead. Coercion first, error second: models
- * routinely stringify nested objects, say "daily", or shorten weekday
- * names, and each of those has one obvious meaning. */
-function normalizeScheduleInput(args: Json): NormalizedSchedule {
-  let raw = args.schedule;
-  if (typeof raw === "string") {
-    // Some models deliver nested objects as JSON strings.
-    try {
-      raw = JSON.parse(raw);
-    } catch {
-      return { error: `The schedule must be a JSON object, not text. ${SUPPORTED_SCHEDULES}` };
-    }
+function renderAssignmentStatus(r: Json, id: string): string {
+  const raw = jsonRecord(r.assignment) ? r.assignment : r;
+  const a: Json = { id, ...raw, botName: raw.botName ?? r.toBotName };
+  const lines = [`Assignment ${assignmentLine(a)}`];
+  const question = typeof a.question === "string" ? a.question.trim() : "";
+  if (question && (a.status === "needs_input" || a.outcome === "needs_input")) {
+    lines.push(`It is parked on a question for the person: ${JSON.stringify(question)}. Nothing moves until the person answers it in that thread; tell them and do not keep checking.`);
   }
-  if (!jsonRecord(raw)) return { error: `The schedule must be a JSON object. ${SUPPORTED_SCHEDULES}` };
-  const type = typeof raw.type === "string" ? raw.type.trim().toLowerCase() : "";
-  const fields = type === "once"
-    ? ["type", "at"]
-    : type === "weekly" || type === "daily"
-      ? ["type", "time", "weekdays"]
-      : type === "interval"
-        ? ["type", "every_minutes", "everyMinutes", "starts_at", "anchorAt", "weekdays", "every_day", "window_start", "window_end", "window", "all_day", "ends_at", "endsAt", "never_ends"]
-        : type === "cron"
-          ? ["type", "expression", "timeZone"]
-          : null;
-  // Provider conversions may send unused optional fields as null. Ignore
-  // those, but never silently discard an actual scheduling constraint (for
-  // example timezone or a misspelled starts_at) and approve different work.
-  const unsupported = fields && Object.keys(raw).find((key) => raw[key] != null && !fields.includes(key));
-  if (unsupported) {
-    return { error: `Unsupported ${type} schedule field "${unsupported}". Weekly and daily times use the computer's timezone from list_routines. ${SUPPORTED_SCHEDULES}` };
-  }
-  if (type === "cron") {
-    try {
-      return { schedule: { ...normalizeCronSchedule({ type, expression: raw.expression, timeZone: raw.timeZone }) } };
-    } catch (error) {
-      return { error: `${error instanceof Error ? error.message : "Invalid cron schedule"}. ${SUPPORTED_SCHEDULES}` };
-    }
-  }
-  if (type === "once") {
-    if (typeof raw.at !== "string" || !raw.at.trim()) {
-      return { error: `A once schedule needs "at": a future RFC3339 date-time with an explicit offset, for example 2026-09-01T09:00:00+05:30.` };
-    }
-    return { schedule: { type: "once", at: raw.at.trim() } };
-  }
-  if (type === "weekly" || type === "daily") {
-    const time = typeof raw.time === "string" ? raw.time.trim() : "";
-    if (!time) return { error: `A ${type} schedule needs "time" in 24-hour HH:MM, for example 09:00.` };
-    let weekdays: string[];
-    if (type === "daily") {
-      // daily = weekly on all seven days; an explicit weekdays list narrows it.
-      weekdays = Array.isArray(raw.weekdays) && raw.weekdays.length ? raw.weekdays : [...WEEKDAYS];
-    } else {
-      if (!Array.isArray(raw.weekdays) || raw.weekdays.length === 0) {
-        return { error: `A weekly schedule needs "weekdays", for example ["monday","friday"] — or use {"type":"daily"} to run every day.` };
-      }
-      weekdays = raw.weekdays;
-    }
-    const normalized: string[] = [];
-    for (const day of weekdays) {
-      const lower = String(day).trim().toLowerCase();
-      const full = (WEEKDAYS as readonly string[]).includes(lower)
-        ? lower
-        : Object.hasOwn(SHORT_WEEKDAYS, lower)
-          ? SHORT_WEEKDAYS[lower as keyof typeof SHORT_WEEKDAYS]
-          : undefined;
-      if (!full) return { error: `Unsupported weekday "${String(day)}". Use full names: ${WEEKDAYS.join(", ")}.` };
-      if (!normalized.includes(full)) normalized.push(full);
-    }
-    return { schedule: { type: "weekly", time, weekdays: normalized } };
-  }
-  if (type === "interval") {
-    for (const flag of ["every_day", "all_day", "never_ends"]) {
-      if (raw[flag] != null && typeof raw[flag] !== "boolean") {
-        return { error: `"${flag}" must be true or false.` };
-      }
-    }
-    if (raw.window != null && (!jsonRecord(raw.window)
-      || Object.keys(raw.window).some((key) => key !== "start" && key !== "end")
-      || typeof raw.window.start !== "string" || typeof raw.window.end !== "string")) {
-      return { error: '"window" must contain "start" and "end" in HH:MM, for example {"start":"09:00","end":"17:00"}.' };
-    }
-    const rawMinutes = raw.every_minutes ?? raw.everyMinutes;
-    const everyMinutes = Number(rawMinutes);
-    if (!Number.isInteger(everyMinutes) || everyMinutes < 5 || everyMinutes > 1_440) {
-      return { error: 'An interval schedule needs "every_minutes": a whole number from 5 to 1440.' };
-    }
-    const rawStart = raw.starts_at ?? raw.anchorAt;
-    if (rawStart !== undefined && (typeof rawStart !== "string" || !rawStart.trim())) {
-      return { error: '"starts_at" must be an RFC3339 date-time with an explicit timezone offset.' };
-    }
-    if (raw.every_day === true && Array.isArray(raw.weekdays) && raw.weekdays.length > 0) {
-      return { error: 'Choose interval "weekdays" or "every_day", not both.' };
-    }
-    let intervalWeekdays: string[] | null | undefined;
-    if (raw.every_day === true) {
-      intervalWeekdays = null;
-    } else if (raw.weekdays !== undefined) {
-      if (!Array.isArray(raw.weekdays) || raw.weekdays.length === 0) {
-        return { error: 'Interval "weekdays" must contain at least one full weekday name.' };
-      }
-      intervalWeekdays = [];
-      for (const day of raw.weekdays) {
-        const lower = String(day).trim().toLowerCase();
-        const full = (WEEKDAYS as readonly string[]).includes(lower)
-          ? lower
-          : Object.hasOwn(SHORT_WEEKDAYS, lower)
-            ? SHORT_WEEKDAYS[lower as keyof typeof SHORT_WEEKDAYS]
-            : undefined;
-        if (!full) return { error: `Unsupported weekday "${String(day)}". Use full names: ${WEEKDAYS.join(", ")}.` };
-        if (!intervalWeekdays.includes(full)) intervalWeekdays.push(full);
-      }
-    }
-    const rawWindow = jsonRecord(raw.window) ? raw.window : undefined;
-    const windowStart = raw.window_start ?? rawWindow?.start;
-    const windowEnd = raw.window_end ?? rawWindow?.end;
-    if (raw.all_day === true && (windowStart !== undefined || windowEnd !== undefined)) {
-      return { error: 'Choose window_start + window_end or "all_day", not both.' };
-    }
-    let window: Json | null | undefined;
-    if (raw.all_day === true) {
-      window = null;
-    } else if (windowStart !== undefined || windowEnd !== undefined) {
-      if (typeof windowStart !== "string" || !windowStart.trim() || typeof windowEnd !== "string" || !windowEnd.trim()) {
-        return { error: 'An interval time window needs both "window_start" and "window_end" in 24-hour HH:MM.' };
-      }
-      window = { start: windowStart.trim(), end: windowEnd.trim() };
-    }
-    const rawEnd = raw.ends_at ?? raw.endsAt;
-    if (raw.never_ends === true && rawEnd !== undefined) {
-      return { error: 'Choose "ends_at" or "never_ends", not both.' };
-    }
-    let endsAt: string | null | undefined;
-    if (raw.never_ends === true) endsAt = null;
-    else if (rawEnd !== undefined) {
-      if (typeof rawEnd !== "string" || !rawEnd.trim()) {
-        return { error: '"ends_at" must be an RFC3339 date-time with an explicit timezone offset.' };
-      }
-      endsAt = rawEnd.trim();
-    }
-    return {
-      schedule: {
-        type: "interval",
-        everyMinutes,
-        ...(typeof rawStart === "string" ? { anchorAt: rawStart.trim() } : {}),
-        ...(intervalWeekdays !== undefined ? { weekdays: intervalWeekdays } : {}),
-        ...(window !== undefined ? { window } : {}),
-        ...(endsAt !== undefined ? { endsAt } : {}),
-      },
-    };
-  }
-  if (type === "hourly" || type === "minutes") {
-    return { error: `Use an interval schedule for every-N-minutes work. ${SUPPORTED_SCHEDULES}` };
-  }
-  return { error: `Unknown schedule type "${type || "(missing)"}". ${SUPPORTED_SCHEDULES}` };
+  const result = typeof a.result === "string" ? a.result.trim() : "";
+  if (result) lines.push(`Result${result.length > RESULT_HEAD ? " (first part)" : ""}: ${result.slice(0, RESULT_HEAD)}`);
+  const children = Array.isArray(r.children) ? r.children.filter(jsonRecord) : [];
+  if (children.length) lines.push("Its own hand-offs:", ...children.map((child) => `- ${assignmentLine(child)}`));
+  const settled = a.status === "completed" || a.status === "failed" || a.status === "cancelled" || a.status === "done";
+  if (!settled) lines.push("It is not settled. Its result resumes you on its own; do not wait on it in this turn.");
+  return lines.join("\n");
 }
 
-type RoutineAction = "update" | "pause" | "resume" | "run_now" | "delete";
+function handoffIds(r: Json): string[] {
+  const receipts = Array.isArray(r.receipts) ? r.receipts.filter(jsonRecord) : [];
+  return receipts.map((receipt) => receipt.requestId).filter((id): id is string => typeof id === "string" && id.trim().length > 0);
+}
+const MOVED_ENTRIES_SHOWN = 5;
+const FORGOTTEN_SHOWN = 8;
 
-/** Keeps a large result within what a model should be handed, saving the
- * rest in the harness for tool_result_read. */
+/** A preference saved once in the person's About me, which every bot reads in their work. */
+function preferText(r: Json): string {
+  const whose = typeof r.person === "string" && r.person ? `${r.person}'s` : "the person's";
+  return r.preference === "saved"
+    ? `Saved in ${whose} About me, which every bot reads in their work. Don't pass it on to other bots or save it in your own notes too.`
+    : `Already in ${whose} About me, or they removed it before: nothing to save or pass on.`;
+}
+
+function forgetText(passage: string, r: Json): string {
+  const list = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  const notes = list(r.forgotten);
+  const aboutMe = list(r.aboutMe);
+  if (!notes.length && !aboutMe.length) {
+    return `Nothing saved mentions ${JSON.stringify(passage)}: not in your notes, not in About me. Try other words for it once; if nothing matches, tell the person it was not saved.`;
+  }
+  const facts = [...new Set([...notes, ...aboutMe])];
+  const shown = facts.slice(0, FORGOTTEN_SHOWN).map((fact) => JSON.stringify(fact)).join(", ");
+  const more = facts.length > FORGOTTEN_SHOWN ? ` and ${facts.length - FORGOTTEN_SHOWN} more` : "";
+  return `Forgotten everywhere it was saved${aboutMe.length ? ", About me included, which all their bots read" : ""}: ${shown}${more}. Confirm to the person in one plain line what you forgot.`;
+}
+
 export const capResult = (text: string, context: ToolCallContext) => boundedAgentResult(text, (retained, truncated) => {
-  // The standing capability cannot write/read cached tool results. Keep the
-  // normal bounded fallback without making a forbidden request or retrying.
   if (context.externalRuntime) throw new Error("External runtime results are not cached");
   return context.client.api("/api/internal/tool-result", { method: "POST", signal: AbortSignal.timeout(3_000),
     body: JSON.stringify({ text: retained, truncated }) });
 });
 
-/** "1st", "2nd", "3rd", "4th" — the queue position as a person says it. */
 function ordinal(n: number): string {
   const rem100 = n % 100;
   if (rem100 >= 11 && rem100 <= 13) return `${n}th`;
@@ -299,62 +142,7 @@ function jsonRecord(value: unknown): value is Json {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function routineAction(value: unknown): RoutineAction | null {
-  return value === "update" || value === "pause" || value === "resume" || value === "run_now" || value === "delete"
-    ? value
-    : null;
-}
-
-function routineFields(args: Json): { fields: Json; error?: string } {
-  const fields: Json = {};
-  // list_routines returns the harness names. Accept those when a model
-  // copies back a definition, as we already do for interval fields.
-  const destination = (value: unknown) => value === "box" ? "cloud" : value;
-  if (args.run_on != null && args.runOn != null && destination(args.run_on) !== destination(args.runOn)) {
-    return { fields, error: "Choose one run_on destination; run_on and runOn disagree." };
-  }
-  if (args.timeout_minutes != null && args.timeoutMinutes != null && args.timeout_minutes !== args.timeoutMinutes) {
-    return { fields, error: "Choose one timeout_minutes limit; timeout_minutes and timeoutMinutes disagree." };
-  }
-  const runOn = destination(args.run_on ?? args.runOn);
-  const timeoutMinutes = args.timeout_minutes ?? args.timeoutMinutes;
-  if (runOn != null && runOn !== "maus" && runOn !== "cloud") {
-    return { fields, error: 'Use run_on="maus" for the bot’s current model and configured computer (including VPS), or run_on="box" only for the Box-hosted agent. Legacy "cloud" also means Box.' };
-  }
-  if (timeoutMinutes != null && (
-    typeof timeoutMinutes !== "number" || !Number.isInteger(timeoutMinutes) || timeoutMinutes < 5 || timeoutMinutes > 240
-  )) {
-    return { fields, error: "timeout_minutes must be a whole number from 5 to 240. Use clear_timeout to remove a limit." };
-  }
-  if (args.continuity != null && typeof args.continuity !== "boolean") {
-    return { fields, error: "continuity must be true or false." };
-  }
-  if (args.overlap !== undefined && args.overlap !== "skip" && args.overlap !== "queue") {
-    return { fields, error: "overlap must be skip or queue." };
-  }
-  if (args.clear_timeout != null && typeof args.clear_timeout !== "boolean") {
-    return { fields, error: "clear_timeout must be true or false." };
-  }
-  if (args.clear_timeout === true && timeoutMinutes != null) {
-    return { fields, error: "Choose timeout_minutes or clear_timeout, not both." };
-  }
-  if (typeof args.name === "string") fields.name = args.name.trim();
-  if (typeof args.instructions === "string") fields.instructions = args.instructions.trim();
-  if (args.schedule !== undefined && args.schedule !== null) {
-    const normalized = normalizeScheduleInput(args);
-    if (normalized.error) return { fields, error: normalized.error };
-    fields.schedule = normalized.schedule;
-  }
-  if (runOn != null) fields.runOn = runOn;
-  if (args.clear_timeout === true) fields.timeoutMinutes = null;
-  else if (timeoutMinutes != null) fields.timeoutMinutes = timeoutMinutes;
-  if (typeof args.continuity === "boolean") fields.continuity = args.continuity;
-  if (args.overlap !== undefined) fields.overlap = args.overlap;
-  return { fields };
-}
-
-/** Full Access is decided by the harness, not inferred from a model claim or
- * local environment flag. Missing state preserves older pending responses. */
+/** Full Access is decided by the harness, never inferred from a model claim or a local flag. */
 function completedProposalResult(r: Json, subject: string): { text: string; isError?: boolean } | undefined {
   const state = r.state;
   const result = jsonRecord(r.result) ? r.result : undefined;
@@ -378,27 +166,64 @@ function confirmationResult(r: Json, fallback: string, noun = "routine"): { text
   };
 }
 
-/** Who said a recalled line, as the header of a hit or a read. A user-role
- * line another bot delivered with ask_bot is labelled as that bot's: the
- * snippet windows past the provenance note in the text, and a peer's ask
- * recalled as the user's request is the misattribution the note exists to
- * prevent. */
 function recallSpeaker(hit: Json): string {
-  if (typeof hit.peer === "string" && hit.peer) return `@${hit.peer} (another bot, via ask_bot — not your user)`;
+  if (typeof hit.peer === "string" && hit.peer) return `@${hit.peer} (another bot — not your user)`;
   if (typeof hit.from === "string" && hit.from) return hit.from;
   return hit.role === "user" ? "user" : "you";
 }
 
-export async function callTool(name: string, args: Json, context: ToolCallContext): Promise<ToolCallResult> {
-  // The names this body has always used, so it reads (and diffs) as it did
-  // when these were the proxy's module-level constants.
-  const { botId: BOT_ID, threadId: THREAD_ID, depth: DEPTH, externalRuntime: EXTERNAL_RUNTIME, coordinating: COORDINATING, turn } = context;
-  const { delegationTaskIdsThisTurn } = turn;
+/** Local time: every other date the bot sees (since/until, the brief, daily logs) is local. */
+function recallWhen(at: unknown, dateOnly: boolean): string {
+  if (typeof at !== "number" || !Number.isFinite(at)) return "";
+  const said = new Date(at);
+  if (!Number.isFinite(said.getTime())) return "";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const day = `${said.getFullYear()}-${pad(said.getMonth() + 1)}-${pad(said.getDate())}`;
+  return dateOnly ? day : `${day} ${pad(said.getHours())}:${pad(said.getMinutes())}`;
+}
+
+export async function callTool(called: string, input: Json, context: ToolCallContext): Promise<ToolCallResult> {
+  const { name, arguments: args } = resolveAgentsCall(called, input);
+  const refused = outOfBounds(name, fullInputSchema(name), args);
+  if (refused) return { text: refused, isError: true };
+  const member = agentsCallMember(name, args);
+  const { botId: BOT_ID, threadId: THREAD_ID, depth: DEPTH } = context;
   const { api, apiResponse } = context.client;
-  // Second lock. With sharing off the tool is not in the catalog, so a front
-  // end already refuses the call as an unknown tool — the same answer a build
-  // without the feature gives. This keeps the handler itself refusing if that
-  // list is ever assembled differently.
+  if (name === "vm_exec") {
+    const { ok, body } = await apiResponse("/api/internal/vm-exec", {
+      method: "POST",
+      body: JSON.stringify({ command: args.command, ...(typeof args.timeout_seconds === "number" ? { timeout_seconds: args.timeout_seconds } : {}) }),
+    });
+    if (!ok) return { text: String(body.error ?? "Could not run that command."), isError: true };
+    const exitCode = Number(body.exitCode ?? 0);
+    const stdout = String(body.stdout ?? "");
+    const stderr = String(body.stderr ?? "");
+    const lines = [body.timedOut ? "The command was stopped: it ran past its time limit." : `exit code ${exitCode}`];
+    if (stdout) lines.push("--- stdout ---", stdout.replace(/\s+$/, ""));
+    if (stderr) lines.push("--- stderr ---", stderr.replace(/\s+$/, ""));
+    if (!stdout && !stderr && !body.timedOut) lines.push("(no output)");
+    return { text: lines.join("\n"), ...(exitCode !== 0 || body.timedOut ? { isError: true } : {}) };
+  }
+  if (name === "attach_file") {
+    const { ok, body } = await apiResponse("/api/internal/attach-file", {
+      method: "POST",
+      body: JSON.stringify({ path: args.path, ...(typeof args.name === "string" ? { name: args.name } : {}) }),
+    });
+    if (!ok) return { text: String(body.error ?? "Could not attach that file."), isError: true };
+    return { text: `Attached ${String(body.name ?? "the file")} (${Number(body.bytes ?? 0)} bytes). It now appears in the chat with a preview.` };
+  }
+  if (CARD_TOOL_NAMES.has(name)) return callCardTool(name, args, context);
+  if (RESEARCH_TOOL_NAMES.has(name)) return callResearchTool(name, args, context);
+  if (HELPER_TOOL_NAMES.has(name)) return callHelperTool(name, args, context);
+  if (MAUSBOT_TOOL_NAMES.has(name)) return callMausBotTool(name, args, context);
+  if (PAGE_TOOL_NAMES.has(name)) return callPageTool(name, args, context);
+  if (PERSON_TOOL_NAMES.has(name)) return callPersonTool(name, args, context);
+  if (DEVS_TOOL_NAMES.has(name)) return callDevsTool(name, args, context);
+  if (TRIGGER_TOOL_NAMES.has(name)) return callTriggerTool(name, args, context);
+  if (WAIT_TOOL_NAMES.has(name)) return callWaitTool(name, args, context);
+  if (name === USAGE_LIMITS_TOOL) return callUsageLimitsTool(context);
+  if (COMPUTER_ASK_TOOL_NAMES.has(name)) return callComputerAskTool(args, context);
+  // Second lock: with sharing off the catalog already omits these tools.
   if (SHARED_COMPUTER_TOOL_NAMES.has(name) && !context.sharedComputers) {
     return { text: "Computer sharing is turned off in this workspace. There are no shared computers to use.", isError: true };
   }
@@ -427,60 +252,85 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     return { text: JSON.stringify(r), ...(r.error ? { isError: true } : {}) };
   }
   if (name === "coordinate_bots") {
-    // The tool's arguments are snake_case, but the harness wire they land on
-    // is camelCase, and a caller can reach for that spelling. Map the aliases
-    // to the canonical keys first - the documented snake_case spelling wins
-    // when both arrive - then refuse an unusable call with the field names a
-    // retry needs instead of a generic validation error (#1239).
     const canonical: Json = { ...args };
     delete canonical.botIds;
-    delete canonical.requestKey;
     delete canonical.groupId;
+    delete canonical.doneWhen;
     if (canonical.bot_ids === undefined) canonical.bot_ids = args.botIds;
-    if (canonical.request_key === undefined) canonical.request_key = args.requestKey;
     if (canonical.group_id === undefined) canonical.group_id = args.groupId;
+    if (canonical.done_when === undefined) canonical.done_when = args.doneWhen;
     const ids = canonical.bot_ids;
+    const optional = (key: string, type: "boolean" | "string") => canonical[key] === undefined || typeof canonical[key] === type;
     const usable = Array.isArray(ids) && ids.length > 0 && ids.every((id) => typeof id === "string")
       && typeof canonical.message === "string" && canonical.message.trim().length > 0
-      && typeof canonical.request_key === "string" && canonical.request_key.trim().length > 0;
+      && (canonical.thread === undefined || (typeof canonical.thread === "string" && /^[\w-]{1,128}$/.test(canonical.thread)))
+      && (canonical.reply === undefined || canonical.reply === "resume" || canonical.reply === "none")
+      && optional("consult", "boolean") && optional("in_my_folder", "boolean")
+      && optional("done_when", "string") && optional("reason", "string") && optional("title", "string") && optional("answers", "string");
     if (!usable) {
       return {
-        text: `coordinate_bots takes snake_case arguments: bot_ids (an array of 1-4 teammate ids), message and request_key are required; group_id, rework and label are optional. Received: ${Object.keys(args).join(", ") || "none"}.`,
+        text: `coordinate_bots takes snake_case arguments: bot_ids (an array of 1-4 teammate ids) and message are required; group_id, reason, rework, title, thread ("standing", "new" or the id of a thread you opened on that teammate), reply ("resume" or "none"), consult (true or false), in_my_folder (true or false), done_when and answers are optional. Received: ${Object.keys(args).join(", ") || "none"}.`,
         isError: true,
       };
     }
     const r = await api("/api/internal/coordinate-bots", { method: "POST", body: JSON.stringify({
       groupId: canonical.group_id, botIds: ids, message: canonical.message,
-      requestKey: canonical.request_key, rework: canonical.rework, label: canonical.label,
+      reason: typeof canonical.reason === "string" && canonical.reason.trim() ? canonical.reason.trim() : undefined,
+      rework: canonical.rework,
+      thread: canonical.thread, reply: canonical.reply,
+      title: typeof canonical.title === "string" && canonical.title.trim() ? canonical.title.trim() : undefined, consult: canonical.consult, inMyFolder: canonical.in_my_folder,
+      done_when: typeof canonical.done_when === "string" && canonical.done_when.trim() ? canonical.done_when.trim() : undefined,
+      answers: typeof canonical.answers === "string" && canonical.answers.trim() ? canonical.answers.trim() : undefined,
     }) });
     return { text: JSON.stringify(r), ...(r.error ? { isError: true } : {}) };
+  }
+  if (name === "assignment_status") {
+    const id = args.id === undefined || args.id === null || args.id === "" ? "" : String(args.id).trim();
+    if (id && !/^[\w-]{4,64}$/.test(id)) {
+      return { text: 'assignment_status takes an optional "id" (the assignment id from a coordinate_bots receipt or list_threads) and an optional "wait_ms" (0-240000). Omit id to list every outstanding assignment of this conversation.', isError: true };
+    }
+    if (args.wait_ms !== undefined && (typeof args.wait_ms !== "number" || !Number.isFinite(args.wait_ms) || args.wait_ms < 0)) {
+      return { text: "assignment_status wait_ms must be a whole number of milliseconds from 0 to 240000.", isError: true };
+    }
+    const waitMs = Math.min(Math.trunc(Number(args.wait_ms) || 0), 240_000);
+    const query = new URLSearchParams();
+    if (id) query.set("id", id);
+    if (waitMs > 0) query.set("wait_ms", String(waitMs));
+    const { ok, status, body: r } = await apiResponse(`/api/internal/assignment-status${query.size ? `?${query.toString()}` : ""}`);
+    if (!ok) {
+      const why = status === 404 ? `No assignment ${id || "(none given)"} is known here: check the id against your coordinate_bots receipt or list_threads.`
+        : status === 403 ? `Assignment ${id} is not this conversation's; only its requester can read it.`
+        : String(r.error ?? `HTTP ${status}`);
+      return { text: why, isError: true };
+    }
+    if (id) return { text: renderAssignmentStatus(r, id) };
+    const outstanding = Array.isArray(r.outstanding) ? r.outstanding.filter(jsonRecord) : [];
+    if (!outstanding.length) return { text: "Nothing outstanding: no assignment of this conversation is still open." };
+    return {
+      text: `Outstanding assignments of this conversation (${outstanding.length}):\n${outstanding.map((a) => `- ${assignmentLine(a)}`).join("\n")}\nEach resumes you when it settles; do not wait on them in this turn.`,
+    };
   }
   if (name === "list_bots") {
     const r = await api(`/api/internal/agents?self=${encodeURIComponent(BOT_ID)}`);
     const bots = (r.bots as Array<Json>) ?? [];
-    if (!bots.length) return { text: "No other reachable bots yet." };
+    if (!bots.length) return { text: "No other bots you can reach yet." };
     const lines = bots.map((b) => {
       const role = b.title ? ` — ${b.title}` : "";
       const about = b.description ? ` (${String(b.description).slice(0, 120)})` : "";
-      // statusText is the server's own wording for what the teammate is
-      // doing; an older server only sends busy, so fall back to that.
       const state = typeof b.statusText === "string"
         ? (b.status === "available" ? "" : b.statusText)
         : (b.busy ? "busy" : "");
-      const team = typeof b.section === "string" ? `, team: ${peerName(b.section) || "General"}` : "";
+      const team = typeof b.section === "string" ? `, department: ${peerName(b.section) || "General"}` : "";
       return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${team}${state ? `, ${state}` : ""}]`;
     });
     return {
-      text: `Reachable teammates:\n${lines.join("\n")}\n\n${COORDINATING ? "Use coordinate_bots for advice or concrete work, then end your turn. Busy teammates queue and results resume you automatically." : "Assign work with delegate_bot. Use ask_bot only for a short answer you need inline."}`,
+      text: `Bots you can reach (every department; you can contact any of them):\n${lines.join("\n")}\n\nUse coordinate_bots for concrete work or, with consult: true, for advice, then end your turn. Busy teammates queue and results resume you automatically.`,
     };
   }
   if (name === "list_rooms") {
     const query = new URLSearchParams({ fromBotId: BOT_ID, fromThreadId: THREAD_ID });
     const r = await api(`/api/internal/rooms?${query.toString()}`);
     const rooms = Array.isArray(r.rooms) ? r.rooms.filter(jsonRecord) : [];
-    // A room the bot is in but may not post into comes back named, with the
-    // refusal a post would meet, and without an id: the model gets the exact
-    // reason to hand the user and nothing it could retry against.
     const unpostable = Array.isArray(r.unpostable) ? r.unpostable.filter(jsonRecord) : [];
     const blocked = unpostable.length
       ? `\n\nRooms you are in but cannot post into (no id — there is nothing to retry; give the user the reason instead):\n${
@@ -501,128 +351,18 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
   if (name === "post_to_room") {
     const groupId = String(args.group_id ?? "").trim();
     const message = String(args.message ?? "").trim();
+    const attachVoiceNote = args.attach_voice_note === true;
     if (!groupId || !message) {
       return { text: "post_to_room needs group_id (from list_rooms) and message.", isError: true };
     }
-    if (turn.roomPostsThisTurn >= MAX_ROOM_POSTS_PER_TURN) {
-      return {
-        text: `You have already posted ${MAX_ROOM_POSTS_PER_TURN} times this turn, which is the limit. Do not retry — finish your turn and say anything further to the user directly.`,
-        isError: true,
-      };
-    }
     const r = await api("/api/internal/post-to-room", {
       method: "POST",
-      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, groupId, message }),
+      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, groupId, message, attachVoiceNote }),
     });
     if (r.error) return { text: String(r.error), isError: true };
-    turn.roomPostsThisTurn += 1;
     return {
-      text: `Posted in ${r.roomName ?? "the room"}. Nobody's turn was started, so expect no reply — tell the user it is posted.`,
+      text: `Posted in ${r.roomName ?? "the room"}${r.attachedVoiceNote ? " with the voice note attached" : ""}. Nobody's turn was started, so expect no reply — tell the user it is posted.`,
     };
-  }
-  if (name === "ask_bot") {
-    const toBotId = String(args.bot_id ?? "").trim();
-    const message = String(args.message ?? "").trim();
-    if (!toBotId || !message) return { text: "ask_bot needs bot_id and message.", isError: true };
-    const r = await api(`/api/internal/ask-bot`, {
-      method: "POST",
-      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, toBotId, message, depth: DEPTH }),
-    });
-    if (r.timeout) {
-      // The peer's turn outlived the synchronous wait, so the harness
-      // converted the ask into a delegation — the reply is not lost.
-      const taskId = String(r.taskId ?? "").trim();
-      if (taskId && !EXTERNAL_RUNTIME) delegationTaskIdsThisTurn.add(taskId);
-      const waitedSeconds = Math.max(1, Math.round((Number(r.waitedMs) || 0) / 1000));
-      const amount = waitedSeconds < 60 ? waitedSeconds : Math.round(waitedSeconds / 60);
-      const unit = waitedSeconds < 60 ? "second" : "minute";
-      return {
-        text: `${r.toBotName ?? "That bot"} is still working after ${amount} ${unit}${amount === 1 ? "" : "s"} — the ask was converted to a delegation so the reply is not lost. Task id: ${taskId}. ${EXTERNAL_RUNTIME ? EXTERNAL_STATUS_GUIDANCE : "Finish your turn now; the result will be delivered to this conversation automatically. Use check_delegation in a later turn only if the user asks for status."}`,
-      };
-    }
-    if (r.busy) {
-      // The harness queues the message as a delegation when it can; the
-      // task id is the asker's claim ticket for the eventual reply.
-      const taskId = String(r.taskId ?? "").trim();
-      if (taskId) {
-        if (!EXTERNAL_RUNTIME) delegationTaskIdsThisTurn.add(taskId);
-        return {
-          text: `${r.toBotName ?? "That bot"} is busy right now, so your message was queued as a delegation instead — ${EXTERNAL_RUNTIME ? "it waits for the peer and any required approval" : "it runs after your current turn ends"}. Task id: ${taskId}. ${EXTERNAL_RUNTIME ? EXTERNAL_STATUS_GUIDANCE : "Finish your turn now; the result will be delivered to this conversation automatically. Use check_delegation in a later turn only if the user asks for status."}`,
-        };
-      }
-      return { text: `That bot is busy right now — try again after it finishes.` };
-    }
-    if (r.error) return { text: `Couldn't reach that bot: ${r.error}`, isError: true };
-    return { text: `${r.botName ?? "Bot"} replied:\n${r.text ?? "(no reply)"}` };
-  }
-  if (name === "delegate_bot") {
-    const toBotId = String(args.bot_id ?? "").trim();
-    const message = String(args.message ?? "").trim();
-    const reason = typeof args.reason === "string" ? args.reason.trim() : "";
-    if (!toBotId || !message) return { text: "delegate_bot needs bot_id and message.", isError: true };
-    const body: Record<string, unknown> = {
-      fromBotId: BOT_ID,
-      fromThreadId: THREAD_ID,
-      toBotId,
-      message,
-      depth: DEPTH,
-    };
-    if (reason) body.reason = reason;
-    const r = await api(`/api/internal/delegate-bot`, { method: "POST", body: JSON.stringify(body) });
-    if (r.error) return { text: `Couldn't queue the delegation: ${r.error}`, isError: true };
-    // Fire-and-forget by contract: the harness returns immediately, the
-    // peer turn runs after our current turn finishes. The task id is the
-    // bot's claim ticket for the outcome.
-    const note = typeof r.message === "string" ? r.message : "Delegation queued.";
-    const taskId = typeof r.taskId === "string" ? r.taskId.trim() : "";
-    if (taskId && !EXTERNAL_RUNTIME) delegationTaskIdsThisTurn.add(taskId);
-    const suffix = taskId
-      ? ` Task id: ${taskId}. ${EXTERNAL_RUNTIME ? EXTERNAL_STATUS_GUIDANCE : "Acknowledge the assignment and finish your turn; the result will be delivered to this conversation automatically. Do not check or wait for it in this turn."}`
-      : "";
-    return { text: `${note}${suffix}` };
-  }
-  if (name === "check_delegation" || name === "wait_delegation") {
-    const taskId = String(args.task_id ?? "").trim();
-    if (!/^[\w-]{4,64}$/.test(taskId)) {
-      return { text: `${name} needs the "task_id" that delegate_bot returned, e.g. {"task_id":"1f0c2f4e-..."}.`, isError: true };
-    }
-    if (!EXTERNAL_RUNTIME && delegationTaskIdsThisTurn.has(taskId)) {
-      return {
-        text: `Task ${taskId} was delegated during this turn. Finish your response now so the other bot can work; its result will be delivered to this conversation automatically. Do not check or wait for a newly delegated task until a later turn.`,
-        isError: true,
-      };
-    }
-    const timeout = Math.min(Math.max(Math.trunc(Number(args.timeout_seconds) || 60), 1), 240);
-    const waitMs = name === "wait_delegation" ? timeout * 1000 : 0;
-    const query = new URLSearchParams({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, wait_ms: String(waitMs) });
-    const r = await api(`/api/internal/delegations/${encodeURIComponent(taskId)}?${query.toString()}`);
-    const who = typeof r.toBotName === "string" && r.toBotName ? `@${r.toBotName}` : "the peer";
-    if (r.status === "done") return { text: `${who} finished task ${taskId}:\n${String(r.result || "(no reply text)")}` };
-    if (r.status === "queued") {
-      const why = r.targetStatus === "waiting-on-user"
-        ? ` ${who} is waiting on the user, so it goes through after they answer.`
-        : r.targetStatus === "working" ? ` ${who} is busy with other work.` : "";
-      const expiresInMs = Number(r.expiresInMs);
-      const expiry = !Number.isFinite(expiresInMs)
-        ? ""
-        : expiresInMs <= 0
-          ? " It is past its 24-hour limit and will expire the next time it cannot be delivered."
-          : ` It expires if not picked up within ${Math.ceil(expiresInMs / 3_600_000)} hour${Math.ceil(expiresInMs / 3_600_000) === 1 ? "" : "s"}.`;
-      return { text: `Task ${taskId} is still queued — ${who} hasn't picked it up yet${waitMs ? ` after ${timeout}s` : ""}.${why}${expiry} Keep working and check again later.` };
-    }
-    if (r.status === "running") {
-      const elapsedMs = Number.isFinite(r.elapsedMs) ? Number(r.elapsedMs) : 0;
-      const minutes = Math.floor(elapsedMs / 60_000);
-      const elapsed = minutes >= 1 ? `${minutes} minute${minutes === 1 ? "" : "s"}` : `${Math.round(elapsedMs / 1000)}s`;
-      const activity = Array.isArray(r.recentActivity) ? r.recentActivity.filter((line: unknown) => typeof line === "string") : [];
-      const recent = activity.length
-        ? activity.map((line: string) => `  - ${line}`).join("\n")
-        : "  (no visible activity yet — if this stays empty, the peer may be stuck, not working; say so instead of promising progress)";
-      return {
-        text: `Task ${taskId} is running with ${who} — going on ${elapsed} now.${waitMs ? ` (still going after ${timeout}s)` : ""}\nRecent activity:\n${recent}\nJudge progress by this activity, not by waiting: real work keeps producing lines; the same silence for a long stretch usually means stuck.`,
-      };
-    }
-    return { text: `Task ${taskId} ended without a reply — ${String(r.status ?? "unknown")}${r.result ? `: ${String(r.result)}` : ""}.`, isError: true };
   }
   if (name === "select_computer") {
     if (args.surface !== undefined && (typeof args.surface !== "string" || !["auto", "cloud", "vm", "local", "browser"].includes(args.surface))) {
@@ -641,7 +381,7 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     if (!threads.length) return { text: "No threads yet: you have none of your own beyond this one, and you have not opened any on a teammate." };
     const stateWord: Record<string, string> = { running: "running", "waiting-on-you": "waiting on the person", queued: "queued", idle: "idle" };
     const lines = threads.map((thread) => {
-      const where = thread.own === true ? "yours" : `on @${String(thread.botName)}`;
+      const where = thread.own === true ? "yours" : `on @${String(thread.botName)}${typeof thread.openedBy === "string" && thread.openedBy ? `, opened by @${thread.openedBy}` : ""}`;
       const state = stateWord[String(thread.state)] ?? String(thread.state);
       const unread = thread.unread === true ? ", unread for the person" : "";
       const handoff = typeof thread.delegationId === "string" && thread.delegationId ? ` [delegation id: ${thread.delegationId}]` : "";
@@ -660,28 +400,24 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     const title = String(args.title ?? "").trim();
     const message = String(args.message ?? "").trim();
     if (!title || !message) return { text: "start_thread needs title (one short line) and message (the complete first message).", isError: true };
-    if (turn.threadsOpenedThisTurn >= MAX_THREADS_PER_TURN) {
-      return {
-        text: `You have already opened ${MAX_THREADS_PER_TURN} threads this turn, which is the limit. Do not retry — finish your turn and tell the person which threads you still wanted to open, so they can open them or ask you again.`,
-        isError: true,
-      };
-    }
     const toBotId = typeof args.bot_id === "string" ? args.bot_id.trim() : "";
-    if (COORDINATING && toBotId && toBotId !== BOT_ID) {
-      return { text: "Use coordinate_bots for teammates; start_thread only opens a separate job on yourself.", isError: true };
-    }
     const folder = typeof args.folder === "string" ? args.folder.trim() : "";
     const body: Record<string, unknown> = { fromBotId: BOT_ID, fromThreadId: THREAD_ID, title, message, depth: DEPTH };
     if (toBotId) body.toBotId = toBotId;
     if (folder) body.folder = folder;
+    if (args.model_selection !== undefined) {
+      const fields = jsonRecord(args.model_selection) ? args.model_selection : null;
+      if (!fields || typeof fields.instanceId !== "string" || !fields.instanceId.trim() || typeof fields.model !== "string" || !fields.model.trim()) {
+        return { text: "start_thread model_selection needs instanceId and model.", isError: true };
+      }
+      body.modelSelection = { instanceId: fields.instanceId.trim(), model: fields.model.trim() };
+    }
     const r = await api("/api/internal/threads", { method: "POST", body: JSON.stringify(body) });
-    // A refusal opened nothing. A "failed" state opened the thread and could
-    // not start its turn — that one still counts, and still has an id.
     if (r.error && r.state !== "failed") return { text: `Couldn't open that thread: ${String(r.error)}`, isError: true };
-    turn.threadsOpenedThisTurn += 1;
-    const threadTitle = String(r.title ?? title);
-    const threadId = String(r.threadId ?? "");
-    const where = r.self === true ? "on yourself" : `on @${String(r.botName ?? "that bot")}`;
+    const receipt = r.self !== true && Array.isArray(r.receipts) && jsonRecord(r.receipts[0]) ? r.receipts[0] : undefined;
+    const threadTitle = String(r.title ?? receipt?.title ?? title);
+    const threadId = String(r.threadId ?? receipt?.threadId ?? "");
+    const where = r.self === true ? "on yourself" : `on @${String(r.botName ?? receipt?.botName ?? "that bot")}`;
     const opened = `Opened thread #${threadTitle} ${where} [thread id: ${threadId}].`;
     if (r.self === true) {
       if (r.state === "running") {
@@ -694,11 +430,7 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
       }
       return { text: `${opened} It could not start: ${String(r.error ?? "unknown reason")}. The thread exists but nothing is running in it; tell the person.`, isError: true };
     }
-    // A peer thread is a handoff: like delegate_bot, it starts after this
-    // turn and reports back here, so the id is a claim ticket the model
-    // must not cash in this same turn.
-    const delegationId = typeof r.delegationId === "string" ? r.delegationId.trim() : "";
-    if (delegationId) delegationTaskIdsThisTurn.add(delegationId);
+    const assignmentId = handoffIds(r)[0] ?? "";
     const approval = r.approvalRequired === true
       ? " The person must approve this handoff first; their card appears after your turn ends."
       : "";
@@ -706,11 +438,14 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
       ? ` @${String(r.botName ?? "that bot")} can run ${Number(r.limit) || 0} threads at once and they are all spoken for, so it waits ${ordinal(Number(r.position) || 1)} in line for a free slot after this turn ends.`
       : " It starts when this turn ends, like any handoff.";
     return {
-      text: `${opened}${timing}${approval} Its result will be delivered to this conversation automatically (delegation id: ${delegationId || "unknown"}). Acknowledge it, mention it to the person as #${threadTitle}, and finish your turn; do not check or wait for it in this turn.`,
+      text: `${opened}${timing}${approval} Its result will be delivered to this conversation automatically (assignment id: ${assignmentId || "unknown"}). Acknowledge it, mention it to the person as #${threadTitle}, and finish your turn; do not check or wait for it in this turn.`,
     };
   }
   if (name === "list_team_setup") {
     return { text: JSON.stringify(await api("/api/internal/team-setup-catalog")) };
+  }
+  if (name === "list_team_library") {
+    return { text: JSON.stringify(await api("/api/internal/team-library")) };
   }
   if (name === "propose_team_setup" || name === "propose_bot_deletion") {
     const deleting = name === "propose_bot_deletion";
@@ -730,9 +465,6 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     if (!botName || !role || !instructions) {
       return { text: "create_bot needs name, role, and instructions.", isError: true };
     }
-    if (turn.createdThisTurn >= MAX_CREATED_PER_TURN) {
-      return { text: `You can create at most ${MAX_CREATED_PER_TURN} bots in one turn. Use the team you have before adding more.`, isError: true };
-    }
     const r = await api(`/api/internal/create-bot`, {
       method: "POST",
       body: JSON.stringify({
@@ -741,25 +473,30 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
         name: botName,
         role,
         instructions,
+        ...(args.modelSelection !== undefined ? { modelSelection: args.modelSelection } : {}),
+        ...(typeof args.cwd === "string" ? { cwd: args.cwd.trim() } : {}),
       }),
     });
-    turn.createdThisTurn += 1;
+    if (r.state === "pending") {
+      return { text: `One review card is visible: ${String(r.title)}. @${botName} has not been created yet. End this turn; the decision and structured result resume you automatically once. Do not ask again, poll, or repeat this request.` };
+    }
+    if (!r.id) return completedProposalResult(r, `creating @${botName}`) ?? { text: `@${botName} was not created.`, isError: true };
     return {
-      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}]. Assign work with ${COORDINATING ? "coordinate_bots" : "delegate_bot"}.`,
+      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}].${r.modelSelection ? ` Model: ${JSON.stringify(r.modelSelection)}.` : ""} Assign work with coordinate_bots.`,
     };
   }
-  if (name === "create_room") {
-    if (args.section !== undefined) return { text: "Room sections are fixed to your own section; ask the user to move rooms.", isError: true };
+  if (member === "create_room") {
+    if (args.section !== undefined) return { text: "A room you create stays in your own department; ask the user to move it.", isError: true };
     const roomName = String(args.name ?? "").trim();
     const memberIds = Array.isArray(args.member_bot_ids)
       ? args.member_bot_ids.map((id) => String(id).trim()).filter(Boolean)
       : [];
     const bulletin = typeof args.bulletin === "string" ? args.bulletin.trim() : undefined;
     if (!roomName) {
-      return { text: "create_room needs a room name.", isError: true };
+      return { text: "manage_room action=create needs a room name.", isError: true };
     }
     if (!memberIds.length) {
-      return { text: "create_room needs at least one bot ID in member_bot_ids.", isError: true };
+      return { text: "manage_room action=create needs at least one bot ID in member_bot_ids.", isError: true };
     }
     const r = await api(`/api/internal/create-room`, {
       method: "POST",
@@ -776,12 +513,12 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
       text: `Created room “${r.name ?? roomName}” in section “${r.section ?? "General"}” [id: ${r.id}] with ${r.memberCount ?? memberIds.length} members.`,
     };
   }
-  if (name === "manage_room") {
+  if (member === "manage_room") {
     if (args.section !== undefined || args.action === "set_section") return { text: "Moving rooms between sections is user-only.", isError: true };
     const roomId = String(args.room_id ?? "").trim();
     const action = String(args.action ?? "").trim();
     if (!roomId || !action) {
-      return { text: "manage_room needs room_id and action.", isError: true };
+      return { text: "manage_room needs action and, for any action but create, the room_id from list_rooms.", isError: true };
     }
     const memberIds = Array.isArray(args.member_bot_ids)
       ? args.member_bot_ids.map((id) => String(id).trim()).filter(Boolean)
@@ -806,6 +543,7 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
   }
   if (name === "request_credential") {
     const credentialId = args.credential_id;
+    if (credentialId === undefined || credentialId === "") return requestCustomSecret(args, context);
     if (!isCredentialTargetId(credentialId)) {
       return { text: "request_credential needs a supported credential_id.", isError: true };
     }
@@ -822,83 +560,66 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     if (r.alreadyConfigured) {
       return { text: `${r.label ?? CREDENTIAL_TARGETS[credentialId].label} is already configured. Continue the task.` };
     }
+    if (credentialId === "onePasswordToken") {
+      return { text: `A secure ${r.label ?? CREDENTIAL_TARGETS[credentialId].label} request is ready: the person pastes it into its card in OpenMausBot, on their computer or in My Cloud, and OpenMausBot checks it with 1Password before keeping it. End this turn; OpenMausBot will resume the task after they save or decline. Never ask them to paste the token into chat, and never pass it to a command line.` };
+    }
     return {
       text: `A secure ${r.label ?? CREDENTIAL_TARGETS[credentialId].label} request is ready. The desktop app and a freshly QR-paired mobile app show its secure entry card; older mobile pairings explain how to pair again or finish on the computer. End this turn; OpenMausBot will resume the task after the user saves or declines. Never ask them to paste the key into chat.`,
     };
   }
-  if (name === "list_routines") {
-    const query = new URLSearchParams({ fromBotId: BOT_ID, fromThreadId: THREAD_ID });
-    const r = await api(`/api/internal/routines?${query.toString()}`);
-    const routines = Array.isArray(r.routines) ? r.routines : [];
-    const now = typeof r.now === "string" ? r.now : new Date().toISOString();
-    const timeZone = typeof r.timeZone === "string" && r.timeZone ? r.timeZone : "local computer timezone";
-    if (!routines.length) {
-      return { text: `This bot has no routines. Current time: ${now}. Timezone: ${timeZone}.` };
-    }
+  if (name === "request_sign_in") {
+    const site = typeof args.site === "string" ? args.site.trim() : "";
+    if (!site) return { text: "request_sign_in needs site: the page's address or its domain, such as example.com.", isError: true };
+    const reason = typeof args.reason === "string" ? args.reason.trim().slice(0, 240) : "";
+    const r = await api("/api/internal/request-sign-in", {
+      method: "POST",
+      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, site, ...(reason ? { reason } : {}) }),
+    });
     return {
-      text: `This bot's routines (current time: ${now}; timezone: ${timeZone}):\n${JSON.stringify(routines, null, 2)}`,
+      text: `The person was asked to sign in to ${r.site ?? site} on ${SIGN_IN_PLACES[String(r.place)] ?? "the place you work"}. Your turn ends now: say in one short line that you are waiting for them, then stop. OpenMausBot resumes you when they finish or decline. Never ask for the password or a code in chat.`,
     };
   }
-  if (name === "propose_routine") {
-    const { fields: routine, error: scheduleError } = routineFields(args);
-    if (scheduleError) return { text: scheduleError, isError: true };
-    if (!routine.name || !routine.instructions || !routine.schedule) {
-      return { text: "propose_routine needs name, instructions, and schedule.", isError: true };
-    }
-    const forBotId = String(args.for_bot_id ?? "").trim();
-    const r = await api("/api/internal/routine-requests", {
+  if (name === "fill_login") {
+    const username = typeof args.username === "string" ? args.username.trim().slice(0, 512) : "";
+    const r = await api("/api/internal/fill-login", {
       method: "POST",
-      body: JSON.stringify({
-        fromBotId: BOT_ID,
-        fromThreadId: THREAD_ID,
-        action: "create",
-        routine,
-        // JSON.stringify drops the key entirely when no target was named
-        forBotId: forBotId || undefined,
-      }),
+      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, ...(username ? { username } : {}), ...(args.submit === false ? { submit: false } : {}) }),
     });
-    return confirmationResult(r, `the new routine “${routine.name}”`);
+    return { text: typeof r.text === "string" && r.text ? r.text : "fill_login did not answer. Call request_sign_in instead.", ...(r.ok === true ? {} : { isError: true }) };
   }
-  if (name === "propose_routine_action") {
-    const routineId = String(args.routine_id ?? "").trim();
-    const action = routineAction(args.action);
-    if (!routineId || !action) {
-      return { text: "propose_routine_action needs a routine_id and supported action.", isError: true };
+  if (name === "send_voice_note") {
+    if (typeof args.text !== "string" || !args.text.trim()) {
+      return { text: "send_voice_note needs text: the short speakable note, at most 1000 characters.", isError: true };
     }
-    const body: Json = {
-      fromBotId: BOT_ID,
-      fromThreadId: THREAD_ID,
-      action,
-      routineId,
-    };
-    if (action === "update") {
-      if (!jsonRecord(args.changes)) {
-        return { text: "The update action needs at least one field in changes.", isError: true };
-      }
-      const { fields: changes, error: scheduleError } = routineFields(args.changes);
-      if (scheduleError) return { text: scheduleError, isError: true };
-      if (!Object.keys(changes).length) {
-        return { text: "The update action needs at least one supported field in changes.", isError: true };
-      }
-      body.changes = changes;
-    } else if (args.changes !== undefined) {
-      return { text: `The ${action} action does not accept changes.`, isError: true };
+    const text = args.text.trim();
+    if (text.length > 1000) {
+      return { text: `send_voice_note is limited to 1000 characters; this one is ${text.length}. Shorten the note.`, isError: true };
     }
-    const r = await api("/api/internal/routine-requests", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    return confirmationResult(r, `${action.replace("_", " ")} on routine ${routineId}`);
+    try {
+      await api("/api/internal/voice-note", {
+        method: "POST",
+        body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, text }),
+      });
+      return { text: "Voice note recorded. It will be attached to this turn's reply when the turn ends; the note text is also the visible caption." };
+    } catch (error) {
+      return { text: `Voice note not sent: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+    }
   }
   if (name === "propose_profile") {
+    if ((args.notifications !== undefined && typeof args.notifications !== "boolean")
+      || (args.speakReplies !== undefined && typeof args.speakReplies !== "boolean")) {
+      return { text: "propose_profile notifications and speakReplies must be true or false.", isError: true };
+    }
     const changes: Json = {};
     if (typeof args.name === "string") changes.name = args.name.trim();
     if (typeof args.title === "string") changes.title = args.title.trim();
     if (typeof args.description === "string") changes.description = args.description.trim();
     if (typeof args.soul === "string") changes.soul = args.soul;
     if (typeof args.cwd === "string") changes.cwd = args.cwd.trim();
+    if (typeof args.notifications === "boolean") changes.notifications = args.notifications;
+    if (typeof args.speakReplies === "boolean") changes.speakReplies = args.speakReplies;
     if (!Object.keys(changes).length) {
-      return { text: "propose_profile needs at least one of name, title, description, soul, or cwd.", isError: true };
+      return { text: "propose_profile needs at least one of name, title, description, soul, cwd, notifications, or speakReplies.", isError: true };
     }
     const forBotId = String(args.for_bot_id ?? "").trim();
     const r = await api("/api/internal/profile-requests", {
@@ -908,23 +629,43 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
         fromThreadId: THREAD_ID,
         changes,
         reason: args.reason,
-        // JSON.stringify drops the key entirely when no target was named
         forBotId: forBotId || undefined,
       }),
     });
     return confirmationResult(r, "the profile change", "profile");
   }
-  if (name === "memory_update") {
-    if (!["append", "replace", "remove", "supersede"].includes(String(args.action))
-      || (args.action !== "remove" && (typeof args.text !== "string" || !args.text.trim()))
-      || (args.action !== "append" && (typeof args.old_text !== "string" || !args.old_text.trim()))) {
-      return { text: "Use memory_update action=append with text, replace or supersede with text and old_text, or remove with old_text.", isError: true };
+  if (name === "propose_model") {
+    const raw = args.model_selection;
+    const fields = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+    if (!fields || typeof fields.instanceId !== "string" || !fields.instanceId.trim() || typeof fields.model !== "string" || !fields.model.trim()) {
+      return { text: "propose_model needs model_selection with instanceId and model.", isError: true };
     }
-    if (turn.memoryRefusalsThisTurn >= MAX_MEMORY_REFUSALS_PER_TURN) {
-      return {
-        text: `Memory updates are closed for the rest of this turn: ${MAX_MEMORY_REFUSALS_PER_TURN} were refused. Do not retry. Tell the person what you wanted to keep and why it did not fit; they can tidy MEMORY.md in Settings, and you can try again in your next turn.`,
-        isError: true,
-      };
+    if ((fields.effort !== undefined && (typeof fields.effort !== "string" || !fields.effort.trim()))
+      || (fields.variant !== undefined && (typeof fields.variant !== "string" || !fields.variant.trim()))) {
+      return { text: "propose_model effort and variant must be non-empty strings when supplied.", isError: true };
+    }
+    const selection: Json = { instanceId: fields.instanceId.trim(), model: fields.model.trim() };
+    if (typeof fields.effort === "string" && fields.effort.trim()) selection.effort = fields.effort.trim();
+    if (typeof fields.variant === "string" && fields.variant.trim()) selection.variant = fields.variant.trim();
+    const forBotId = String(args.for_bot_id ?? "").trim();
+    const r = await api("/api/internal/model-requests", {
+      method: "POST",
+      body: JSON.stringify({
+        fromBotId: BOT_ID,
+        fromThreadId: THREAD_ID,
+        modelSelection: selection,
+        reason: args.reason,
+        forBotId: forBotId || undefined,
+      }),
+    });
+    return confirmationResult(r, "the default model change", "model");
+  }
+  if (member === "memory_update") {
+    const passageOnly = args.action === "remove" || args.action === "forget";
+    if (!["append", "replace", "remove", "supersede", "forget", "prefer"].includes(String(args.action))
+      || (!passageOnly && (typeof args.text !== "string" || !args.text.trim()))
+      || (args.action !== "append" && args.action !== "prefer" && (typeof args.old_text !== "string" || !args.old_text.trim()))) {
+      return { text: "Use memory_update action=append with text, replace or supersede with text and old_text, remove with old_text, forget with old_text naming what to forget, or prefer with text: one standing preference of the person.", isError: true };
     }
     const { body: r } = await apiResponse("/api/internal/memory", {
       method: "POST",
@@ -934,18 +675,23 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
         action: args.action,
         text: args.text,
         oldText: args.old_text,
+        ...(typeof args.until === "string" && args.until.trim() ? { until: args.until.trim() } : {}),
       }),
     });
-    if (r.error || r.ok !== true) {
-      turn.memoryRefusalsThisTurn += 1;
-      const recent = Array.isArray(r.recent) ? r.recent.filter((line) => typeof line === "string") : [];
-      // A full file: the refusal carries the newest entries so the model
-      // can merge them in this same turn without a read round trip.
-      const tail = r.code === "over-budget" && recent.length ? `\n\nMost recent entries, oldest first:\n${recent.join("\n")}` : "";
-      return { text: `${String(r.error ?? "Memory update was not confirmed.")}${tail}`, isError: true };
-    }
+    if (r.error || r.ok !== true) return { text: String(r.error ?? "Memory update was not confirmed."), isError: true };
+    if (args.action === "forget") return { text: forgetText(String(args.old_text), r) };
+    if (args.action === "prefer") return { text: preferText(r) };
     const entry = typeof r.entry === "string" && r.entry ? ` Entry: ${r.entry}` : "";
-    return { text: `Memory updated.${entry}${r.truncated ? " MEMORY.md exceeds the prompt load budget; keep it short and curated." : ""}` };
+    const moved = Array.isArray(r.moved) ? r.moved.filter((line) => typeof line === "string") : [];
+    const full = r.truncated
+      ? "\nSaved, but the lines that never move out of MEMORY.md (hand-written ones, health and safety facts) fill what loads each session, so the newest entries do not load. Tell the person their saved notes are full, and that they can remove ones they no longer need under What it remembers in your panel."
+      : "";
+    const shown = moved.slice(0, MOVED_ENTRIES_SHOWN).map((text) => text.split("\n")[0]);
+    const more = moved.length > shown.length ? `\n…and ${moved.length - shown.length} more` : "";
+    const movedNote = moved.length
+      ? `\nTo stay within what loads each session, moved ${moved.length === 1 ? "1 older entry" : `${moved.length} older entries`} to your archive (session_search finds them):\n${shown.join("\n")}${more}`
+      : "";
+    return { text: `Memory updated.${entry}${full}${movedNote}` };
   }
   if (name === "retry_thread") {
     const botId = String(args.bot_id ?? "").trim();
@@ -959,7 +705,7 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     if (r.error) return { text: `Couldn't retry that thread: ${String(r.error)}`, isError: true };
     return { text: typeof r.message === "string" ? r.message : "The thread is running again. Its result stays in that thread; you are not woken for it — check it later with session_search or list_threads if you need to." };
   }
-  if (name === "memory_log") {
+  if (member === "memory_log") {
     if (typeof args.text !== "string" || !args.text.trim()) {
       return { text: "memory_log needs text: one line about what happened.", isError: true };
     }
@@ -970,7 +716,25 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     if (r.error || r.ok !== true) return { text: String(r.error ?? "The log line was not confirmed."), isError: true };
     return { text: `Logged to ${String(r.file)}: ${String(r.line)}` };
   }
-  if (name === "session_search") {
+  if (name === "propose_team_memory") {
+    const kind = String(args.kind ?? "").trim();
+    const entryName = String(args.name ?? "").trim();
+    const detail = String(args.detail ?? "").trim();
+    if (!kind || !entryName || !detail) return { text: "propose_team_memory needs kind, name, and detail.", isError: true };
+    const r = await api("/api/internal/team-memory", {
+      method: "POST", body: JSON.stringify({
+        fromBotId: BOT_ID,
+        fromThreadId: THREAD_ID,
+        kind,
+        key: typeof args.key === "string" ? args.key : undefined,
+        name: entryName,
+        detail,
+        aliases: Array.isArray(args.aliases) ? args.aliases.filter((alias) => typeof alias === "string") : undefined,
+      }),
+    });
+    return confirmationResult(r, `the team memory entry for ${entryName}`, "entry");
+  }
+  if (member === "session_search") {
     const q = String(args.query ?? "").trim();
     const since = typeof args.since === "string" ? args.since.trim() : "";
     const until = typeof args.until === "string" ? args.until.trim() : "";
@@ -982,19 +746,14 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     if (since) query.set("since", since);
     if (until) query.set("until", until);
     if (typeof args.limit === "number" && Number.isFinite(args.limit)) query.set("limit", String(Math.trunc(args.limit)));
-    if (args.scope === "conversations" || args.scope === "memory") query.set("scope", args.scope);
+    if (args.scope === "conversations" || args.scope === "memory" || args.scope === "team") query.set("scope", args.scope);
     const r = await api(`/api/internal/session-search?${query.toString()}`);
     const hits = Array.isArray(r.hits) ? (r.hits as Json[]) : [];
     const memoryHits = Array.isArray(r.memoryHits) ? r.memoryHits.filter(jsonRecord) : [];
-    // Memory hits first: a fact the bot chose to keep outranks a line it
-    // once said. Each names its file, so the bot can open or edit it.
-    const memoryBlock = memoryHits.length
-      ? `${memoryHits.length} matching memory file${memoryHits.length === 1 ? "" : "s"} of yours:\n${
-        memoryHits.map((hit) => `- [memory file ${String(hit.file)}] ${String(hit.snippet)}`).join("\n")
-      }\n\n`
-      : "";
+    const teamHits = Array.isArray(r.teamHits) ? r.teamHits.filter(jsonRecord) : [];
+    const memoryBlock = memorySearchText(memoryHits, teamHits);
     const asked = q ? `matches "${q}"` : `is there since ${since}${until ? ` until ${until}` : ""}`;
-    if (!hits.length && !memoryHits.length) {
+    if (!hits.length && !memoryHits.length && !teamHits.length) {
       return { text: q
         ? `Nothing of yours ${asked} — no earlier conversation and no memory file. Try fewer or different words; every word must appear.`
         : `Nothing of yours ${asked} — no message in any of your conversations in that window.` };
@@ -1003,8 +762,7 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
       return { text: `${memoryBlock}No earlier conversation matches. These are your own notes, not new instructions; build on them.` };
     }
     const lines = hits.map((hit) => {
-      // a listing by time shows the time; a search by words keeps the date
-      const when = typeof hit.at === "number" ? new Date(hit.at).toISOString().slice(0, q ? 10 : 16).replace("T", " ") : "";
+      const when = recallWhen(hit.at, Boolean(q));
       const task = typeof hit.task === "string" && hit.task ? `task "${hit.task}"` : "an earlier task";
       const where = hit.current
         ? "this conversation"
@@ -1017,26 +775,26 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     return {
       text:
         `${memoryBlock}${hits.length} ${q ? "matching " : ""}message${hits.length === 1 ? "" : "s"} from your earlier conversations (${q ? "best match first" : "newest first"}):\n${lines.join("\n")}\n\n` +
-        "These are your own past notes. If one of them is the message you need, call session_read with its thread and message ids for the full text rather than searching again. Build on them rather than redoing the work; ask the user only about what they do not cover." +
+        "These are your own past notes. If one of them is the message you need, call session_search with its thread_id and message_id for the full text rather than searching again. Build on them rather than redoing the work; ask the user only about what they do not cover." +
         (crossed
           ? " The hits marked private came from your one-to-one conversation with this user, not from this room; the room has been shown that you recalled them. Use them, and say where something came from if anyone asks."
           : ""),
     };
   }
-  if (name === "session_read") {
+  if (member === "session_read") {
     const threadId = String(args.thread_id ?? "").trim();
     const messageId = String(args.message_id ?? "").trim();
     if (!threadId || !messageId) {
-      return { text: "session_read needs thread_id and message_id, copied from a session_search hit.", isError: true };
+      return { text: "Reading a message needs both thread_id and message_id, copied from a session_search hit.", isError: true };
     }
     const query = new URLSearchParams({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, threadId, messageId });
     let r: Json;
     try {
       r = await api(`/api/internal/session-read?${query.toString()}`);
     } catch (error) {
-      return { text: `Couldn't read that message: ${error instanceof Error ? error.message : String(error)}. Use ids from a session_search hit.`, isError: true };
+      return { text: `Couldn't read message ${JSON.stringify(messageId.slice(0, 80))} in thread ${JSON.stringify(threadId.slice(0, 80))}: ${error instanceof Error ? error.message : String(error)}. Copy thread_id and message_id exactly from a session_search hit's "thread …" and "message …" fields.`, isError: true };
     }
-    const when = typeof r.at === "number" ? new Date(r.at).toISOString().slice(0, 10) : "";
+    const when = recallWhen(r.at, true);
     const readTask = typeof r.task === "string" && r.task ? `task "${r.task}"` : "an earlier task";
     const where = threadId === THREAD_ID ? "this conversation" : r.crossed ? `${readTask}, private to this user` : readTask;
     const note = r.crossed
@@ -1055,24 +813,19 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     const live = skills.length
       ? skills.map((skill) => {
         const row = skill as Json;
-        // Disabled imports have not been reviewed yet. Never return their
-        // description to the authoring model: a hostile description is still
-        // prompt content. Names and lifecycle status are sufficient for
-        // duplicate detection.
-        const editable = row.editable === true;
-        const status = row.enabled ? "enabled" : "disabled";
-        return `- ${row.name} (${status}, ${editable ? "learned/editable" : "imported"})`;
+        // Unreviewed imports: a hostile description is still prompt content, so only names and status.
+        const revision = typeof row.revision === "string" ? `, shared with your team, revision ${row.revision}` : "";
+        return `- ${row.name} (${row.enabled ? "enabled" : "disabled"}, ${row.editable === true ? "learned/editable" : "imported"}${revision})`;
       }).join("\n")
       : "(none)";
     const pending = staged.length
       ? staged.map((entry) => {
         const row = entry as Json;
-        // A pending proposal is also unreviewed. Keep its gist and source out
-        // of provider-visible tool output until the person approves it.
+        // A pending proposal is unreviewed too.
         return `- ${row.action} ${row.name}`;
       }).join("\n")
       : "(none)";
-    return { text: `Imported skills:\n${live}\n\nStaged (waiting for the user to confirm):\n${pending}` };
+    return { text: `Imported skills:\n${live}\n\nStaged (waiting for the user's decision):\n${pending}` };
   }
   if (name === "skill_manage") {
     if (args.action !== "create" && args.action !== "update") {
@@ -1093,12 +846,13 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     const r = await api("/api/internal/skills/stage", {
       method: "POST",
       body: JSON.stringify({
-        fromBotId: BOT_ID,
-        fromThreadId: THREAD_ID,
+        fromBotId: BOT_ID, fromThreadId: THREAD_ID,
         action: args.action,
         skill_name: skillName || undefined,
         skill_md: skillMd,
+        ...(Array.isArray(args.references) ? { references: args.references } : {}),
         gist: typeof args.gist === "string" ? args.gist : undefined,
+        base_revision: typeof args.base_revision === "string" ? args.base_revision : undefined,
         source,
       }),
     });
@@ -1114,5 +868,27 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
       text: `A confirmation card is now visible to the user for ${proposal}.${warningText}\n\n${status} End this turn and wait for the decision.`,
     };
   }
+  if (name === "mcp_server") {
+    const r = await apiResponse("/api/internal/mcp-servers", { method: "POST", body: JSON.stringify(args) });
+    if (!r.ok) return { text: String(r.body.error ?? `mcp_server failed (HTTP ${r.status}).`), isError: true };
+    return { text: String(r.body.text ?? "") };
+  }
   return { text: `Unknown tool: ${name}`, isError: true };
+}
+
+/** A secret OpenMausBot does not keep: the person agrees to one use, and the bot gets a secretRef or a file path back. */
+async function requestCustomSecret(args: Json, context: ToolCallContext): Promise<ToolCallResult> {
+  const r = await context.client.apiResponse("/api/internal/request-credential", {
+    method: "POST",
+    body: JSON.stringify({ fromBotId: context.botId, fromThreadId: context.threadId, label: args.label, reason: args.reason, placeholder: args.placeholder, delivery: args.delivery }),
+  });
+  const label = typeof r.body.label === "string" ? r.body.label : "the secret";
+  if (!r.ok) return { text: String(r.body.error ?? `request_credential failed (HTTP ${r.status}).`), isError: true };
+  if (typeof r.body.text === "string") return { text: `${r.body.text} Continue the task.` };
+  const asked = r.body.savedAs === "ref"
+    ? ` ${label} was saved earlier for OpenMausBot's tools only, not as a file for your commands (not a file request), so this card asks for it again.`
+    : r.body.savedAs === "file" ? ` ${label} was saved earlier as a file for your commands, not as a secretRef, so this card asks for it again.` : "";
+  return {
+    text: `A secure card for ${label} is ready in OpenMausBot, on the computer and on a freshly QR-paired phone.${asked} End this turn now and say in one line that you are waiting for it; OpenMausBot resumes you when the person saves or declines, and tells you how to use it. Never ask for it in chat.`,
+  };
 }

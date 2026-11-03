@@ -13,7 +13,7 @@ vi.mock("react", async (original) => ({ ...await original<typeof import("react")
   useEffect: (effect: EffectCallback) => { fixture.effects.push(effect); },
 }));
 vi.mock("@/state/store", () => ({ api: fixture.api }));
-import { WorkspaceBackupRecovery, WorkspaceBackupSettings, WorkspaceBackupSummaryView } from "./WorkspaceBackupSettings";
+import { WorkspaceBackupRecovery, WorkspaceBackupRestartNotice, WorkspaceBackupSettings, WorkspaceBackupSummaryView } from "./WorkspaceBackupSettings";
 
 type Node = ReactElement<{ children?: ReactNode; type?: string; disabled?: boolean; value?: string; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void; onClick?: () => void }>;
 function nodes(value: ReactNode): Node[] {
@@ -21,10 +21,10 @@ function nodes(value: ReactNode): Node[] {
   const node = value as Node;
   return [node, ...Children.toArray(node.props.children).flatMap(nodes)];
 }
-function render(recovery = false) {
+function render(recovery: boolean | "restart" = false) {
   fixture.index = 0; fixture.effects = [];
   let tree: ReactNode;
-  function Capture() { tree = recovery ? WorkspaceBackupRecovery({ children: createElement("p", null, "Normal app") }) : WorkspaceBackupSettings(); return tree; }
+  function Capture() { tree = recovery === "restart" ? WorkspaceBackupRestartNotice() : recovery ? WorkspaceBackupRecovery({ children: createElement("p", null, "Normal app") }) : WorkspaceBackupSettings(); return tree; }
   const html = renderToStaticMarkup(createElement(Capture));
   return { html, nodes: nodes(tree) };
 }
@@ -47,11 +47,11 @@ describe("Settings full backups", () => {
     const html = render().html;
     expect(html).toContain('type="file" accept=".ombbackup"');
     expect(html.match(/type="password"/g)).toHaveLength(3);
-    expect(html).toContain("remote VM disks");
+    expect(html).toContain("the disks of remote desktops");
     expect(html).toContain("Saved account credentials and connections are not included");
     expect(html).toContain("existing credentials on the destination stay unchanged");
     expect(html).toContain("not automatically redacted");
-    expect(html).not.toContain("Replace workspace");
+    expect(html).not.toContain("Replace installation");
     const preview = renderToStaticMarkup(createElement(WorkspaceBackupSummaryView, { summary }));
     for (const text of ["Validated backup", "0.1.71", "Bots", "Threads", "Messages", "Fixture warning", "External CLI sign-ins"]) expect(preview).toContain(text);
   });
@@ -89,7 +89,7 @@ describe("Settings full backups", () => {
     expect(fixture.api.mock.calls[1]).toEqual(["/api/workspace-backup/upload", { method: "POST", headers: { "content-type": "application/octet-stream" }, body: file }]);
     expect(JSON.parse(fixture.api.mock.calls[2][1].body)).toEqual({ id: "upload-id", password: "correct horse battery" });
     view = render();
-    const replace = () => render().nodes.find((node) => node.type === "button" && node.props.children === "Replace workspace")!;
+    const replace = () => render().nodes.find((node) => node.type === "button" && node.props.children === "Replace installation")!;
     expect(replace().props.disabled).toBe(true);
     const confirm = view.nodes.filter((node) => node.type === "input" && !node.props.type)[0];
     change(confirm, "replace"); expect(replace().props.disabled).toBe(true);
@@ -98,7 +98,7 @@ describe("Settings full backups", () => {
     replace().props.onClick!(); await flush();
     expect(JSON.parse(fixture.api.mock.calls[3][1].body)).toEqual({ id: "stage-id", confirmation: "REPLACE" });
     expect(storage.get("omb-pending-workspace-restore")).toBe("stage-id");
-    expect(render().html).toContain("Fully quit OpenMausBot");
+    expect(render().html).toContain("Fully quit MausBot");
   });
 
   it("does not offer a replacement after failed password validation", async () => {
@@ -108,7 +108,7 @@ describe("Settings full backups", () => {
     fixture.api.mockResolvedValueOnce({ id: "upload" }).mockRejectedValueOnce(new Error("Wrong password"));
     submit(render().nodes.filter((node) => node.type === "form")[1]); await flush();
     const html = render().html;
-    expect(html).toContain('role="alert"'); expect(html).toContain("Wrong password"); expect(html).not.toContain("Replace workspace");
+    expect(html).toContain('role="alert"'); expect(html).toContain("Wrong password"); expect(html).not.toContain("Replace installation");
   });
 
   it("reuploads the selected file if its upload or validated stage expires", async () => {
@@ -123,7 +123,7 @@ describe("Settings full backups", () => {
     await validate();
     change(render().nodes.find((node) => node.type === "input" && !node.props.type)!, "REPLACE");
     fixture.api.mockRejectedValueOnce(expired);
-    render().nodes.find((node) => node.type === "button" && node.props.children === "Replace workspace")!.props.onClick!(); await flush();
+    render().nodes.find((node) => node.type === "button" && node.props.children === "Replace installation")!.props.onClick!(); await flush();
     expect(render().html).not.toContain("Validated backup");
     fixture.api.mockResolvedValueOnce({ id: "upload-final" }).mockResolvedValueOnce({ id: "stage-final", summary });
     await validate();
@@ -136,7 +136,7 @@ describe("Settings full backups", () => {
     fixture.api.mockResolvedValueOnce({ busy: true, pendingRestore: true });
     expect(render(true).html).not.toContain("Continue without restoring drafts");
     fixture.effects[0](); await flush();
-    expect(render(true).html).toContain("Fully quit OpenMausBot");
+    expect(render(true).html).toContain("Fully quit MausBot");
     expect(render(true).html).not.toContain("Continue without restoring drafts");
     expect(fixture.api).toHaveBeenCalledOnce(); expect(storage.get("omb-drafts")).toBe("old");
     fixture.values = [];
@@ -144,6 +144,52 @@ describe("Settings full backups", () => {
     render(true); fixture.effects[0](); await flush();
     expect(storage.get("omb-drafts")).toBe("restored"); expect(storage.get("auth-token")).toBe("keep");
     expect(storage.has("omb-pending-workspace-restore")).toBe(false); expect(window.location.reload).toHaveBeenCalledOnce();
+  });
+
+  it("offers a real desktop restart without clearing the restore marker or drafts, once only", async () => {
+    const relaunch = vi.fn().mockResolvedValue(true);
+    vi.stubGlobal("window", { ...window, ogb: { relaunch } });
+    storage.set("omb-pending-workspace-restore", "stage-id"); storage.set("omb-drafts", "keep");
+    fixture.api.mockResolvedValueOnce({ busy: true, pendingRestore: true });
+    render(true); fixture.effects[0](); await flush();
+    expect(render(true).html).toContain("Restart and restore");
+    expect(render(true).html).not.toContain(">Retry<");
+    fixture.values = [];
+    const restart = render("restart").nodes.find(node => node.type === "button")!;
+    restart.props.onClick!(); restart.props.onClick!(); await flush();
+    expect(relaunch).toHaveBeenCalledOnce();
+    expect(render("restart").nodes.find(node => node.type === "button")!.props.disabled).toBe(true);
+    expect(storage.get("omb-pending-workspace-restore")).toBe("stage-id");
+    expect(storage.get("omb-drafts")).toBe("keep");
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
+
+  it.each([false, new Error("Fixture restart unavailable")])("keeps recovery intact and offers a retry when native restart fails (%s)", async result => {
+    const relaunch = result === false ? vi.fn().mockResolvedValue(false) : vi.fn().mockRejectedValue(result);
+    vi.stubGlobal("window", { ...window, ogb: { relaunch } });
+    storage.set("omb-pending-workspace-restore", "stage-id");
+    render("restart").nodes.find(node => node.type === "button")!.props.onClick!(); await flush();
+    const view = render("restart");
+    expect(view.html).toContain("Could not restart MausBot");
+    expect(view.nodes.find(node => node.type === "button")!.props.disabled).toBe(false);
+    expect(storage.get("omb-pending-workspace-restore")).toBe("stage-id");
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, { relaunch: vi.fn(), remoteClient: { active: true } }])("never restarts the local app for a browser or remote workspace", bridge => {
+    window.ogb = bridge as Window["ogb"];
+    const view = render("restart");
+    expect(view.html).toContain("restart the server process");
+    expect(view.html).not.toContain("Restart and restore");
+    expect(view.nodes.filter(node => node.type === "button")).toHaveLength(0);
+  });
+
+  it("retains the server-status retry for browser recovery", async () => {
+    storage.set("omb-pending-workspace-restore", "stage-id");
+    fixture.api.mockResolvedValueOnce({ busy: true, pendingRestore: true });
+    render(true); fixture.effects[0](); await flush();
+    expect(render(true).html).toContain(">Retry<");
+    expect(render(true).html).not.toContain("Restart and restore");
   });
 
   it("never imports a different restore's browser state", async () => {
@@ -176,7 +222,7 @@ describe("Settings full backups", () => {
     fixture.api.mockRejectedValueOnce(Object.assign(new Error("Sign-in required"), { status }));
     render(true); fixture.effects[0](); await flush();
     const view = render(true);
-    expect(view.html).toContain("Retry"); expect(view.html).toContain("This does not undo the workspace restore.");
+    expect(view.html).toContain("Retry"); expect(view.html).toContain("This does not undo the installation restore.");
     expect(view.html).not.toContain("Normal app");
     expect(storage).toEqual(before); expect(window.location.reload).not.toHaveBeenCalled();
     view.nodes.find((node) => node.type === "button" && node.props.children === "Continue without restoring drafts")!.props.onClick!();

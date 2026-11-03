@@ -6,7 +6,6 @@ import { writeFileAtomic } from "./atomic.ts";
 export const teamComputerCreate = z.object({
   name: z.string().trim().min(1).max(60).refine(value => [...value].every(character => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127)),
   acknowledgeCost: z.literal(true),
-  // Clients may keep this id across a lost create response. It is not a Box id.
   requestId: z.string().uuid(),
 }).strict();
 export const teamComputerAssignment = z.object({
@@ -23,9 +22,7 @@ export type TeamComputerRecord = z.infer<typeof entrySchema>;
 export const teamComputerOwner = (id: string): string => `computer_${id}`;
 const failure = (message: string, status = 409) => Object.assign(new Error(message), { status });
 
-/** One server writer owns the data directory. Persist identity before any
- * provider call; failed/retried creates always retain the same Box journal key.
- * Invalid or foreign restored state is never silently reset to an empty pool. */
+/** Persist identity before any provider call, so a retried create keeps its Boat journal key; invalid restored state is never reset. */
 export class TeamComputers {
   private entries: TeamComputerRecord[] = [];
   private problem?: string;
@@ -82,6 +79,13 @@ export class TeamComputers {
   }
   setProblem(id: string, problem?: string): TeamComputerRecord {
     return this.patch(id, { problem: problem?.slice(0, 500) });
+  }
+  renameSection(from: string, to: string): boolean {
+    const entry = this.forSection(from);
+    if (!entry || from === to) return false;
+    if (this.forSection(to)) throw failure("This team already has a computer");
+    this.patch(entry.id, { section: to });
+    return true;
   }
   private patch(id: string, patch: Partial<TeamComputerRecord>): TeamComputerRecord {
     const entries = this.list();

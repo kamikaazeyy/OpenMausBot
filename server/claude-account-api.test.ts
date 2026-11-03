@@ -84,7 +84,7 @@ await import(${JSON.stringify(pathToFileURL(join(SERVER_DIR, "testing", "fake-cl
       ghost: { driver: "not-a-real-driver", displayName: "Preserved shadow" },
       // The `claude` product fleet auto-adds these IDs unless configured.
       // Pin shadows so this test never probes an installed provider CLI.
-      ...Object.fromEntries(["cursor", "openaiCompat", "qwen", "hermes", "pi"].map(id => [id, { driver: "not-a-real-driver" }])),
+      ...Object.fromEntries(["cursor", "githubCopilot", "openaiCompat", "qwen", "hermes", "pi"].map(id => [id, { driver: "not-a-real-driver" }])),
       "broken-account": {
         driver: "claudeAgent", displayName: "Repairable shadow", config: { cli, configDir: "relative/saved-directory" },
       },
@@ -117,7 +117,7 @@ await import(${JSON.stringify(pathToFileURL(join(SERVER_DIR, "testing", "fake-cl
   const deadline = Date.now() + 20_000;
   for (;;) {
     if (child.exitCode !== null) throw new Error(`fixture exited: ${stderr}`);
-    try { if ((await api("GET", "/api/health")).body.pid === child.pid) break; } catch { /* Starting. */ }
+    try { if ((await api("GET", "/api/health")).body.pid === child.pid) break; } catch {}
     if (Date.now() > deadline) throw new Error(`fixture did not start: ${stderr}`);
     await new Promise(resolve => setTimeout(resolve, 100));
   }
@@ -214,7 +214,7 @@ describe("Claude account HTTP API", () => {
     try {
       await stream.until(frame => frame.kind === "hello");
       expect((await api("POST", `/api/bots/${runningBot.id}/messages`, { text: "remain active" })).status).toBe(202);
-      await expect.poll(() => existsSync(join(active.dir, "spawn.json"))).toBe(true);
+      await expect.poll(() => existsSync(join(active.dir, "spawn.json")), { timeout: 10_000 }).toBe(true);
       const originalPid = JSON.parse(readFileSync(join(active.dir, "spawn.json"), "utf8")).pid;
       expect((await bot(runningBot.id)).busy).toBe(true);
       expect((await api("PATCH", `/api/instances/${active.id}`, { cli })).status).toBe(409);

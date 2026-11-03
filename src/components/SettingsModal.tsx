@@ -1,515 +1,275 @@
-// App settings, as a real modal with sections rather than one long panel.
-// Per-bot settings (persona, model, computer) live in BotSettingsDialog — this
-// is the stuff shared by every bot: who you are, your keys, and the
-// machine your bots can borrow.
 import { useEffect, useRef, useState } from "react";
-import { Archive, Coins, FlaskConical, KeyRound, Monitor, Palette, ScrollText, Search, TabletSmartphone, Terminal, User, Users, X, Building2 } from "lucide-react";
-import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
-import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
-import { browserAvailable, browserUnavailableReason, builtInBrowserEnabled, showToolCallsEnabled, skillAuthoringEnabled } from "@/lib/feature-flags";
-import { localeChoices, type LocaleKey } from "@/locales";
+import { Archive, ChartNoAxesColumn, Cloud, CloudDownload, Coins, Download, FlaskConical, KeyRound, LockKeyhole, Monitor, Palette, ScrollText, Search, Settings, Sparkles, TabletSmartphone, Terminal, User, Users, X, Building2, Zap, BookOpen } from "lucide-react";
+import { useStore, type AppSettingsSection } from "@/state/store";
+import { skillsLibraryEnabled } from "@/lib/feature-flags";
+import { type LocaleKey } from "@/locales";
 import { t } from "@/lib/i18n";
-import { withTourReset } from "@/lib/guided-tour";
-import { completionPatch } from "@/lib/onboarding";
-import { ApiKeyRow, OpenAiCompatUrl, VpsConnection } from "./ApiKeys";
-import { useUpdaterState } from "@/lib/updater";
+import { AdminOnly } from "./AdminOnly";
+import { KeysPage } from "./keys/KeysPage";
+import { KEY_CATALOG, keyMatches, keySection, type KeyEntry } from "./keys/key-catalog";
+import { openKeySettings, useKeyFocus } from "./keys/key-focus";
+import { AnalyticsRow } from "./AnalyticsRow";
+import { UpdatesConsentRow } from "./UpdatesConsent";
+import { OpenAtLoginRow } from "./OpenAtLoginRow";
+import { DefaultBotSidebarRow } from "./DefaultBotControls";
+import { TalkShortcutRow, talkShortcutKeywords } from "./TalkShortcutRow";
+import { AttachmentStorageSettings } from "./AttachmentStorageSettings";
+import { DiagnosticsRow } from "./DiagnosticsRow";
+import { DecisionModelSettings } from "./DecisionModelSettings";
 import { EnginesSettings } from "./EnginesSettings";
 import { LocalComputerSection } from "./LocalComputerSection";
 import { CompanionSection } from "./CompanionSection";
 import { ServerPairingCard } from "./ServerPairingCard";
 import { PeopleSection } from "./PeopleSection";
 import { ActivitySection } from "./ActivitySection";
+import { AccessOverview } from "./bot-access/AccessOverview";
 import { useOwnerOrAdmin } from "@/lib/use-owner-or-admin";
+import { currentPhonePairingTarget, phonePairingSettingsAction } from "@/lib/phone-pairing";
 import { CustomDomainSettings } from "./CustomDomainSettings";
-import { BrowserProfilesManager } from "./BrowserProfilesManager";
+import { BuiltInBrowserRow } from "./BrowserSettingsRows";
+import { LoginsSettings } from "./LoginsSettings";
 import { RemoteComputerSection } from "./RemoteComputerSection";
 import { ConnectedWorkspacesSettings } from "./ConnectedWorkspacesSettings";
+import { PlaceLookCard } from "./PlaceLookCard";
+import { ChromeRailRow } from "./ChromeRailToggle";
+import { WindowFrameRow } from "./WindowFrameRow";
 import { OrganizationSettings } from "./OrganizationSettings";
-import { Card, SettingRow, Switch } from "./SettingsPrimitives";
+import { CloudAccountSettings } from "./CloudAccountSettings";
+import { ProSettingsCard } from "./ProIntroduction";
+import { CloudUsageSettings } from "./CloudUsageMeter";
+import { Card, SettingsGroup, SIMPLE_BUTTONS } from "./SettingsPrimitives";
 import { shortcutLabel } from "./ShortcutHint";
 import { UsageSection } from "./UsageSection";
+import { SkillsSection } from "./SkillsSection";
+import { LicenseExpiryBanner } from "./LicenseExpiryBanner";
 import { WorkspacesSection, workspacesAvailable } from "./WorkspacesSection";
 import { SkinPicker } from "./SkinPicker";
+import { ThemeRow } from "./ThemeRow";
+import { ChatWidthRow, FontRow, SidebarToolsLayoutRow } from "./AppearanceSelectRows";
 import { RoomTurnTimeoutSettings } from "./RoomTurnTimeoutSettings";
+import { McpCallTimeoutSettings } from "./McpCallTimeoutSettings";
+import { ProfileFields } from "./ProfileSettings";
 import { ThreadConcurrencySettings } from "./ThreadConcurrencySettings";
+import { AutomaticRecoverySettings } from "./AutomaticRecoverySettings";
 import { ThreadCleanupSettings } from "./ThreadCleanupSettings";
+import { PinnedPanelsSettings } from "./PinnedPanelsSettings";
+import { DefaultBotSettings } from "./NewBotDialog";
 import { WorkspaceBackupSettings } from "./WorkspaceBackupSettings";
 import { CompanyBackupSettings } from "./CompanyBackupSettings";
+import { ImportSettings } from "./ImportSettings";
 import { cn } from "@/lib/cn";
-import { setShowThreads, useShowThreads } from "@/lib/thread-preferences";
+import { scrollWithin } from "@/lib/scroll-within";
+import { glassPopupFrameStyle } from "@/lib/glass-popup";
+import { NotificationRows } from "./NotificationSettingsRows";
+import { useAdvancedMode } from "@/lib/interface-mode";
+import { Select } from "./Select";
+import { SavedStepsRow } from "./SavedStepsRow";
+import { BrowserProfilesRow, ColorUserBubblesRow, AdvancedModeRow, ExperimentalFeaturesRow, LanguageRow, NewBotEffortRow, PinnedCirclesRow, ReplayTourRow, RunCardRow, FollowUpRow, SendKeyRow, ShowThreadsRow, ToolCallsRow, UniversalPinsRow, UpdatesRow } from "./AppSettingsRows";
+import { SIMPLE_ADVANCED_ONLY, SimpleAiPage, SimpleBillingPage, SimpleComputerPage, SimpleGeneralPage, SimpleLooksPage, SimpleUpdatesPage, type Disclose, type SimpleDisclosureId } from "./SettingsSimplePages";
 
-// `labelKey`, not a label: t() reads the active pack when it is called, so a
-// label resolved here at module scope would freeze the language the app booted
-// in. The English keywords stay untranslated — they are a search index, and a
-// pack that omits them still matches what people type.
-const SECTIONS: Array<{
+// labelKey, not a label: t() reads the active pack when called, so a label resolved at module scope would freeze the
+// boot language.
+
+export type SettingsGroup = "you" | "ai" | "computers" | "account";
+
+export const SETTINGS_GROUPS: Array<{ id: SettingsGroup; labelKey: LocaleKey }> = [
+  { id: "you", labelKey: "settings.group.you" },
+  { id: "ai", labelKey: "settings.group.ai" },
+  { id: "computers", labelKey: "settings.group.computers" },
+  { id: "account", labelKey: "settings.group.account" },
+];
+
+export const SECTIONS: Array<{
   id: AppSettingsSection;
+  group: SettingsGroup;
   labelKey: LocaleKey;
   icon: typeof User;
   keywords: string[];
 }> = [
-  { id: "general", labelKey: "settings.section.general", icon: User, keywords: ["profile", "name", "email", "analytics", "updates", "threads", "parallel", "concurrency", "cleanup", "retention", "event log", "event-log", "log size"] },
-  { id: "desktopWorkspaces", labelKey: "settings.section.desktopWorkspaces", icon: Building2, keywords: ["workspace", "cloud", "hosted", "vps", "server", "connect", "pair", "switch", "local"] },
-  { id: "organization", labelKey: "settings.section.organization", icon: Building2, keywords: ["company", "organization", "sign in", "enroll", "managed", "models", "disconnect"] },
-  { id: "appearance", labelKey: "settings.section.appearance", icon: Palette, keywords: ["skin", "theme", "appearance", "tools", "tool calls", "threads", "show threads", "hide threads", "sidebar", "display"] },
-  { id: "experimental", labelKey: "settings.section.experimental", icon: FlaskConical, keywords: ["early", "preview", "learn", "skill", "authoring", "browser", "profiles"] },
-  { id: "connections", labelKey: "settings.section.connections", icon: KeyRound, keywords: ["keys", "api", "composio", "box", "xai", "vps"] },
-  { id: "engines", labelKey: "settings.section.engines", icon: Terminal, keywords: ["models", "claude", "grok", "providers", "cli"] },
-  { id: "companion", labelKey: "settings.section.companion", icon: TabletSmartphone, keywords: ["companion", "device", "phone", "desktop", "client", "host", "pair", "pairing", "mobile", "https", "secure", "tailscale", "wifi", "remote", "advanced", "domain", "dns", "self-hosted", "server", "caddy"] },
-  { id: "computer", labelKey: "settings.section.computer", icon: Monitor, keywords: ["vm", "virtual", "desktop"] },
-  { id: "usage", labelKey: "settings.section.usage", icon: Coins, keywords: ["tokens", "cost", "billing"] },
-  { id: "people", labelKey: "settings.section.people", icon: Users, keywords: ["people", "users", "invite", "sign in", "members", "admins", "access"] },
-  { id: "activity", labelKey: "settings.section.activity", icon: ScrollText, keywords: ["activity", "audit", "log", "history", "who changed", "approvals", "decisions", "admin"] },
-  { id: "backups", labelKey: "settings.section.backups", icon: Archive, keywords: ["export", "import", "restore", "full backup", "password", "recovery"] },
-  { id: "workspaces", labelKey: "settings.section.workspaces", icon: Building2, keywords: ["clients", "tenants", "fleet", "workspaces"] },
+  { id: "general", group: "you", labelKey: "settings.section.general", icon: User, keywords: ["profile", "pinned panels", "web panel", "dashboard", "pin a page", "name", "email", "about me", "about", "suggestions", "suggested", "memory", "analytics", "updates", "product updates", "newsletter", "email updates", "effort", "new bots", "reasoning", "threads", "parallel", "concurrency", "cleanup", "retention", "attachments", "clear attachments", "event log", "event-log", "log size", "automatic recovery", "backup model", "fallback", "routines", "conversation", "schedule", "usage", "limit", "plan", "upgrade", "cloud desktop hours", "storage", "saved steps", "repeat", "replay", "computer tasks", "without ai", "forget", ...talkShortcutKeywords()] },
+  { id: "appearance", group: "you", labelKey: "settings.section.appearance", icon: Palette, keywords: ["skin", "theme", "appearance", "chat width", "width", "wide", "full width", "bubble", "bubbles", "tools", "tool calls", "threads", "show threads", "hide threads", "sidebar", "display", "run", "this run", "run card", "commands", "notifications", "sound", "sounds", "mute", "silent", "chime", "pinned", "circles", "universal", "groups", "top", "send", "enter", "return", "shift+enter", "ctrl+enter", "cmd+enter", "⌘+enter", "new line", "keyboard", "ime", "japanese", "message color", "my messages", "toolbar", "tools layout", "footer", "routines", "triggers", "team map", "color", "colour", "cloud color", "server color", "tint", "sidebar color", "sidebar picture", "picture", "image", "banner", "background", "computers", "your computers", "rail", "strip", "frame", "window frame", "title bar"] },
+  { id: "companion", group: "you", labelKey: "settings.section.companion", icon: TabletSmartphone, keywords: ["companion", "device", "phone", "desktop", "client", "host", "pair", "pairing", "mobile", "https", "secure", "tailscale", "wifi", "remote", "advanced", "domain", "dns", "self-hosted", "server", "caddy"] },
+  { id: "engines", group: "ai", labelKey: "settings.section.engines", icon: Terminal, keywords: ["models", "model providers", "engines", "claude", "codex", "grok", "providers", "cli", "sign in", "subscription"] },
+  { id: "connections", group: "ai", labelKey: "settings.section.connections", icon: KeyRound, keywords: ["keys", "api", "api key", "api keys", "connections", "composio", "box", "xai", "mistral", "cerebras", "meta", "muse", "vps", "router", "openrouter", "base url", "openai", "anthropic", "groq", "greenference", "opencode", "deepseek", "provider", "lm studio", "lmstudio", "llm studio", "llmstudio", "bionic"] },
+  { id: "decisionModel", group: "ai", labelKey: "settings.section.decisionModel", icon: Zap, keywords: ["decision", "extraction", "jev", "typesafe", "cloudflare", "workers ai", "clef", "clairic", "email", "routing", "auto", "rooms", "who answers"] },
+  { id: "skills", group: "ai", labelKey: "settings.section.skills", icon: BookOpen, keywords: ["skills", "library", "assign", "agent skills", "skill md"] },
+  { id: "desktopWorkspaces", group: "computers", labelKey: "settings.section.desktopWorkspaces", icon: Building2, keywords: ["workspace", "cloud", "hosted", "vps", "server", "servers", "connect", "pair", "switch", "local"] },
+  { id: "computer", group: "computers", labelKey: "settings.section.computer", icon: Monitor, keywords: ["vm", "virtual", "desktop", "browser", "built-in browser", "profiles", "browser profiles"] },
+  { id: "logins", group: "computers", labelKey: "settings.section.logins", icon: LockKeyhole, keywords: ["logins", "login", "passwords", "password", "sign in", "2fa", "one-time code", "totp", "fill_login", "1password", "vault"] },
+  { id: "cloudAccount", group: "account", labelKey: "settings.section.cloudAccount", icon: Cloud, keywords: ["cloud", "my cloud", "account", "personal", "sign in", "pro", "subscription", "billing", "sync", "send", "this computer", "bots", "logins", "1password"] },
+  { id: "organization", group: "account", labelKey: "settings.section.organization", icon: Building2, keywords: ["company", "organization", "organisation", "sign in", "enroll", "managed", "models", "disconnect"] },
+  { id: "usage", group: "account", labelKey: "settings.section.usage", icon: Coins, keywords: ["tokens", "cost", "billing", "plan", "quota", "remaining", "weekly", "5-hour", "model", "used"] },
+  { id: "backups", group: "account", labelKey: "settings.section.backups", icon: Archive, keywords: ["export", "import", "restore", "full backup", "password", "recovery"] },
+  { id: "import", group: "account", labelKey: "settings.section.import", icon: Download, keywords: ["import", "grok", "grok bot", "x.ai", "cursor", "claude code", "codex", "gemini", "skills", "mcp", "tools", "bring"] },
+  { id: "people", group: "account", labelKey: "settings.section.people", icon: Users, keywords: ["people", "users", "invite", "sign in", "members", "admins", "access"] },
+  { id: "botAccess", group: "account", labelKey: "settings.section.botAccess", icon: Users, keywords: ["access", "share", "sharing", "who can", "view", "chat", "edit", "permissions", "team", "members", "bots"] },
+  { id: "activity", group: "account", labelKey: "settings.section.activity", icon: ScrollText, keywords: ["activity", "audit", "log", "history", "who changed", "approvals", "decisions", "admin"] },
+  { id: "workspaces", group: "account", labelKey: "settings.section.workspaces", icon: Building2, keywords: ["clients", "tenants", "fleet", "workspaces", "installation", "installations"] },
+  { id: "experimental", group: "account", labelKey: "settings.section.experimental", icon: FlaskConical, keywords: ["early", "preview", "learn", "skill", "authoring"] },
 ];
 
-function sectionMatches(section: (typeof SECTIONS)[number], query: string): boolean {
+export type SimpleSettingsPage = {
+  id: string;
+  labelKey: LocaleKey;
+  icon: typeof User;
+  sections: AppSettingsSection[];
+  keywords?: string[];
+};
+
+export const SIMPLE_PAGES: SimpleSettingsPage[] = [
+  { id: "general", labelKey: "settings.section.general", icon: Settings, sections: ["general", "appearance", "people", "import", "organization", "activity"],
+    keywords: ["account", "theme", "looks", "open at login", "startup", "analytics", "advanced mode"] },
+  { id: "botAccess", labelKey: "settings.section.botAccess", icon: Users, sections: ["botAccess"] },
+  { id: "ai", labelKey: "settings.group.ai", icon: Sparkles, sections: ["engines", "connections"] },
+  { id: "computer", labelKey: "settings.simple.page.computer", icon: Monitor, sections: ["companion", "desktopWorkspaces", "computer", "logins"] },
+  { id: "billing", labelKey: "settings.simple.page.billing", icon: ChartNoAxesColumn, sections: ["usage", "cloudAccount"], keywords: ["billing", "included", "allowance", "cloud hours", "voice"] },
+  { id: "updates", labelKey: "settings.simple.page.updates", icon: CloudDownload, sections: ["updates"],
+    keywords: ["update", "version", "release", "product updates", "newsletter", "email updates", "welcome", "tour", "diagnostics", "logs", "support"] },
+];
+
+export const SIMPLE_HIDDEN_SECTIONS: readonly AppSettingsSection[] = ["backups", "experimental", "workspaces", "skills", "decisionModel"];
+
+
+export const SIMPLE_FOLDED: Partial<Record<AppSettingsSection, SimpleDisclosureId>> = {
+  connections: "ai-keys",
+  remote: "computer-elsewhere",
+  desktopWorkspaces: "computer-elsewhere",
+};
+
+export function simpleSettingsPages(available: ReadonlySet<AppSettingsSection>, open: AppSettingsSection): SimpleSettingsPage[] {
+  const pages = SIMPLE_PAGES
+    .map((page) => ({ ...page, sections: page.sections.filter((id) => available.has(id)) }))
+    .filter((page) => page.sections.length > 0);
+  const hidden = SIMPLE_HIDDEN_SECTIONS.includes(open) && available.has(open) ? SECTIONS.find((entry) => entry.id === open) : undefined;
+  if (hidden) pages.push({ id: hidden.id, labelKey: hidden.labelKey, icon: hidden.icon, sections: [hidden.id] });
+  return pages;
+}
+
+export function revealSettingsBlock(
+  scroller: Parameters<typeof scrollWithin>[0] & { querySelector: (selector: string) => Parameters<typeof scrollWithin>[1] | null },
+  section: AppSettingsSection,
+  indexInPage: number,
+): void {
+  if (indexInPage <= 0) { scroller.scrollTop = 0; return; }
+  const block = scroller.querySelector(`[data-settings-block="${section}"]`);
+  if (block) scrollWithin(scroller, block);
+}
+
+function simplePageMatches(page: SimpleSettingsPage, query: string): boolean {
   if (!query) return true;
+  if ([t(page.labelKey), ...page.keywords ?? []].some((part) => part.toLowerCase().includes(query))) return true;
+  return page.sections.some((id) => {
+    const entry = SECTIONS.find((candidate) => candidate.id === id);
+    return entry ? sectionMatches(entry, query) : false;
+  });
+}
+
+export function sectionMatches(section: (typeof SECTIONS)[number], query: string): boolean {
+  if (!query) return true;
+  if (section.id === "connections" && KEY_CATALOG.some((entry) => keyMatches(entry, query))) return true;
   return [t(section.labelKey), ...section.keywords].some((part) => part.toLowerCase().includes(query));
 }
 
-/** Name + email, persisted to /api/config {profile} on blur. */
-function ProfileFields() {
-  const { state, dispatch } = useStore();
-  const [name, setName] = useState(state.config?.profile?.name ?? "");
-  const [email, setEmail] = useState(state.config?.profile?.email ?? "");
-  useEffect(() => {
-    setName(state.config?.profile?.name ?? "");
-    setEmail(state.config?.profile?.email ?? "");
-  }, [state.config?.profile?.name, state.config?.profile?.email]);
-
-  const save = () => {
-    void fetch("/api/config", {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ profile: { name: name.trim(), email: email.trim().toLowerCase() } }),
-    })
-      .then((r) => r.json())
-      .then((config) => dispatch({ type: "configStatus", config }))
-      .catch(() => {});
-  };
-
-  const inputClass =
-    "w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[14px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none";
-  return (
-    <div className="flex flex-col gap-3">
-      <input aria-label={t("settings.profile.name")} value={name} onChange={(e) => setName(e.target.value)} onBlur={save} placeholder={t("settings.profile.name")} className={inputClass} />
-      <input
-        type="email"
-        aria-label={t("phone.signIn.email")}
-        value={email}
-        onChange={(e) => setEmail(e.target.value)}
-        onBlur={save}
-        placeholder="you@example.com"
-        className={inputClass}
-      />
-    </div>
-  );
+export function keySearchResults(query: string): KeyEntry[] {
+  return query ? KEY_CATALOG.filter((entry) => keyMatches(entry, query)).slice(0, 8) : [];
 }
 
-function UpdatesRow() {
-  const s = useUpdaterState();
-  if (!window.ogb?.updater) return null;
-  const updater = window.ogb.updater;
-  const label =
-    s?.status === "checking"
-      ? t("settings.updates.checking")
-      : s?.status === "available"
-        ? t("settings.updates.available", { version: s.version ?? "" })
-        : s?.status === "downloading"
-          ? s.percent == null
-            ? t("settings.updates.startingDownload")
-            : t("settings.updates.downloading", { percent: Math.round(s.percent) })
-          : s?.status === "preparing"
-            ? t("settings.updates.preparing")
-            : s?.status === "downloaded"
-              ? s.installMode === "handoff"
-                ? t("settings.updates.readyInstall", { version: s.version ?? "" })
-                : t("settings.updates.ready", { version: s.version ?? "" })
-              : s?.status === "installing"
-                ? s.message ||
-                  (s.installMode === "handoff"
-                    ? t("settings.updates.openingTerminal")
-                    : t("settings.updates.restarting"))
-                : s?.status === "handed-off"
-                  ? t("settings.updates.handedOff")
-                  : s?.status === "error"
-                    ? t("settings.updates.failed", { message: s.message ?? t("settings.updates.unknownError") })
-                    : t("settings.updates.latest");
-  return (
-    <SettingRow title={t("settings.updates.title")} subtitle={label}>
-      <button
-        onClick={() => {
-          if (s?.status === "available") return void updater.download();
-          if (s?.status === "downloaded") return void updater.install();
-          void updater.check();
-        }}
-        disabled={
-          s?.status === "checking" || s?.status === "downloading" || s?.status === "preparing" ||
-          s?.status === "installing" || s?.retryable === false
-        }
-        className="ui-button"
-      >
-        {s?.retryable === false
-          ? t("settings.updates.quitReopen")
-          : s?.status === "available"
-            ? t("settings.updates.download")
-            : s?.status === "downloaded"
-              ? s.installMode === "handoff"
-                ? t("settings.updates.install")
-                : t("settings.updates.restart")
-              : s?.status === "preparing"
-                ? t("settings.updates.preparingShort")
-                : s?.status === "installing"
-                  ? s.installMode === "handoff"
-                    ? t("settings.updates.opening")
-                    : t("settings.updates.restartingShort")
-                  : t("settings.updates.check")}
-      </button>
-    </SettingRow>
-  );
-}
-
-/** Usage analytics, on by default and switchable here. Naming what is sent
- * matters more than the switch: people who cannot see the scope assume the
- * worst, and the worst — conversation text — is exactly what this never
- * sends (autocapture is off; see lib/analytics.ts). */
-function AnalyticsRow() {
-  const [on, setOn] = useState(analyticsEnabled);
-  return (
-    <SettingRow title={t("settings.analytics.title")} subtitle={t("settings.analytics.subtitle")}>
-      <Switch
-        checked={on}
-        aria-label={t("settings.analytics.aria")}
-        onClick={() => {
-          const next = !on;
-          setAnalyticsEnabled(next);
-          setOn(next);
-        }}
-      />
-    </SettingRow>
-  );
-}
-
-/** Clears the tour's steps and opens it again on the live interface. */
-function ReplayAppTourButton() {
-  const { state, dispatch } = useStore();
-  const [saving, setSaving] = useState(false);
-  const [failed, setFailed] = useState(false);
-  return (
-    <div>
-      <button
-        disabled={saving}
-        onClick={() => {
-          setSaving(true);
-          setFailed(false);
-          void api("/api/config", {
-            method: "PUT",
-            body: JSON.stringify({ onboarding: {
-              // Upgraded users may have completed only the legacy browser gate.
-              ...(!state.config?.onboarding?.completedAt ? completionPatch().onboarding : {}),
-              hintsSeen: withTourReset(state.config?.onboarding),
-            } }),
-            signal: AbortSignal.timeout(10_000),
-          })
-            .then((config) => {
-              dispatch({ type: "configStatus", config });
-              dispatch({ type: "toggleTour", open: true });
-            })
-            .catch(() => setFailed(true))
-            .finally(() => setSaving(false));
-        }}
-        className="ui-button"
-      >
-        {t("settings.welcome.appTour")}
-      </button>
-      {failed && <p role="alert" className="mt-2 text-[13px] text-danger">{t("onboarding.tour.error")}</p>}
-    </div>
-  );
-}
-
-function ReplayTourRow() {
-  const { dispatch } = useStore();
-  return (
-    <SettingRow title={t("settings.welcome.title")} subtitle={t("settings.welcome.subtitle")}>
-      <div className="flex flex-wrap gap-2">
-        <ReplayAppTourButton />
-        <button
-          onClick={() => dispatch({ type: "toggleWelcome", open: true })}
-          className="ui-button"
-        >
-          {t("settings.welcome.replay")}
-        </button>
-      </div>
-    </SettingRow>
-  );
-}
-
-function LanguageRow() {
-  const { state, dispatch } = useStore();
-  const current = state.config?.language ?? "";
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-
-  const save = async (language: string) => {
-    if (saving) return;
-    setSaving(true);
-    setError("");
-    try {
-      const config: ConfigStatus = await api("/api/config", {
-        method: "PATCH",
-        body: JSON.stringify({ language }),
-      });
-      dispatch({ type: "configStatus", config });
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : t("settings.language.error"));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <SettingRow
-      title={t("settings.language.title")}
-      subtitle={t("settings.language.subtitle")}
-      message={error ? <p role="alert" className="text-danger">{error}</p> : null}
-    >
-      <select
-        value={current}
-        disabled={saving}
-        aria-label={t("settings.language.aria")}
-        onChange={(event) => void save(event.target.value)}
-        className="min-h-8 w-full max-w-[240px] rounded-lg border border-hairline/40 bg-inset px-2.5 py-1.5 text-[13px] text-ink focus:border-focus disabled:cursor-wait disabled:opacity-50"
-      >
-        <option value="">{t("settings.language.system")}</option>
-        {localeChoices.map(({ code, label }) => (
-          <option key={code} value={code}>
-            {label}
-          </option>
-        ))}
-      </select>
-    </SettingRow>
-  );
-}
-
-function ShowThreadsRow() {
-  const enabled = useShowThreads();
-  return (
-    <SettingRow title={t("settings.threadDisplay.title")} subtitle={t("settings.threadDisplay.subtitle")}>
-      <Switch
-        checked={enabled}
-        aria-label={t("settings.threadDisplay.show")}
-        onClick={() => setShowThreads(!enabled)}
-      />
-    </SettingRow>
-  );
-}
-
-function ToolCallsRow() {
-  const { state, dispatch } = useStore();
-  const enabled = showToolCallsEnabled(state.config);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-
-  const toggle = async () => {
-    if (saving) return;
-    setSaving(true);
-    setError("");
-    try {
-      const config: ConfigStatus = await api("/api/config", {
-        method: "PATCH",
-        body: JSON.stringify({ features: { showToolCalls: !enabled } }),
-      });
-      dispatch({ type: "configStatus", config });
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : t("settings.toolCalls.error"));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <SettingRow
-      title={t("settings.toolCalls.title")}
-      subtitle={<>{t("settings.toolCalls.subtitle")} {t("settings.toolCalls.detail")}</>}
-      message={error ? <p role="alert" className="text-danger">{error}</p> : null}
-    >
-      <Switch
-        checked={enabled}
-        aria-label={t("settings.toolCalls.aria")}
-        disabled={saving}
-        onClick={() => void toggle()}
-        className="disabled:cursor-wait disabled:opacity-50"
-      />
-    </SettingRow>
-  );
-}
-
-function ExperimentalFeaturesRow() {
-  const { state, dispatch } = useStore();
-  const skillAuthoring = skillAuthoringEnabled(state.config);
-  const browser = builtInBrowserEnabled(state.config);
-  const desktopBrowser = browserAvailable(state.config);
-  const browserInstallable = state.config?.browserEngine?.installable === true;
-  const browserBlockedOnWindows = window.ogb?.platform === "win32" && !desktopBrowser && !browserInstallable;
-  const [saving, setSaving] = useState<"skillAuthoring" | "browser" | null>(null);
-  const [error, setError] = useState("");
-
-  const toggle = async (feature: "skillAuthoring" | "browser", next: boolean) => {
-    if (saving) return;
-    setSaving(feature);
-    setError("");
-    try {
-      const config: ConfigStatus = await api("/api/config", {
-        method: "PATCH",
-        body: JSON.stringify({ features: { [feature]: next } }),
-      });
-      dispatch({ type: "configStatus", config });
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : t("settings.experimental.error"));
-    } finally {
-      setSaving(null);
-    }
-  };
-
-  return (
-    <Card title={t("settings.experimental.title")} subtitle={t("settings.experimental.subtitle")}>
-      <div className="flex items-center justify-between gap-4">
-        <div className="min-w-0">
-          <div className="text-[14px] font-medium text-ink">{t("settings.experimental.skillAuthoring")}</div>
-          <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-            {t("settings.experimental.skillAuthoringDetail")}
-          </div>
-        </div>
-        <Switch
-          checked={skillAuthoring}
-          aria-label={t("settings.experimental.skillAuthoringAria")}
-          disabled={saving !== null}
-          onClick={() => void toggle("skillAuthoring", !skillAuthoring)}
-          className="disabled:cursor-wait disabled:opacity-50"
-        />
-      </div>
-      <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline/30 pt-4">
-        <div className="min-w-0">
-          <div className="text-[14px] font-medium text-ink">{t("settings.experimental.browser")}</div>
-          <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-            {desktopBrowser
-              ? browser
-                ? t("settings.experimental.browserOn")
-                : t("settings.experimental.browserOff")
-              : browserBlockedOnWindows
-                ? t("settings.experimental.browserWindows")
-                : browserUnavailableReason(state.config)}
-          </div>
-        </div>
-        <Switch
-          checked={browser}
-          aria-label={t("settings.experimental.browserAria")}
-          disabled={saving !== null || (!browser && !desktopBrowser && !browserInstallable)}
-          onClick={() => void toggle("browser", !browser)}
-          className="disabled:cursor-wait disabled:opacity-50"
-        />
-      </div>
-      {error ? <p role="alert" className="mt-2 text-[12px] text-danger">{error}</p> : null}
-    </Card>
-  );
-}
-
-function BrowserProfilesRow() {
-  const { state } = useStore();
-  const profiles = state.config?.browserProfiles ?? [];
-  if (!builtInBrowserEnabled(state.config) && profiles.length === 0) return null;
-  return (
-    <Card title={t("settings.profiles.title")} subtitle={t("settings.profiles.sharedSubtitle")}>
-      <BrowserProfilesManager />
-    </Card>
-  );
-}
-
-/** Writes a redacted diagnostics file to a location the user picks. The
- * report holds versions, configured-or-not booleans and the server.log tail —
- * never credential values (the desktop shell does not read secret fields). */
-function DiagnosticsRow() {
-  const [exporting, setExporting] = useState(false);
-  const [result, setResult] = useState<{ kind: "success" | "error"; message: string } | null>(null);
-
-  const exportDiagnostics = async () => {
-    if (!window.ogb?.exportDiagnostics || exporting) return;
-    setExporting(true);
-    setResult(null);
-    try {
-      const path = await window.ogb.exportDiagnostics();
-      if (path) setResult({ kind: "success", message: t("settings.diagnostics.saved", { path }) });
-    } catch (e) {
-      setResult({ kind: "error", message: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setExporting(false);
-    }
-  };
-
-  return (
-    <SettingRow
-      title={t("settings.diagnostics.title")}
-      subtitle={t("settings.diagnostics.subtitle")}
-      message={result ? (
-        <p role={result.kind === "error" ? "alert" : "status"} className={cn("break-all", result.kind === "error" ? "text-danger" : "text-success")}>
-          {result.message}
-        </p>
-      ) : null}
-    >
-      <button
-        onClick={() => void exportDiagnostics()}
-        disabled={exporting}
-        aria-label={t("settings.diagnostics.aria")}
-        className="ui-button"
-      >
-        {exporting ? t("settings.diagnostics.exporting") : t("settings.diagnostics.export")}
-      </button>
-    </SettingRow>
-  );
-}
+export const openKeyResult = (entry: KeyEntry) => entry.uses ? openKeySettings(entry.uses, entry.id) : openKeySettings(entry.id);
 
 export function SettingsModal() {
   const { state, dispatch } = useStore();
+  const advanced = useAdvancedMode();
   const remoteActive = window.ogb?.remoteClient?.active === true;
+  const requested = state.appSettingsSection;
   const section: AppSettingsSection =
-    (remoteActive && !["appearance", "desktopWorkspaces"].includes(state.appSettingsSection)) || state.appSettingsSection === "remote"
+    (remoteActive && !["appearance", "desktopWorkspaces"].includes(requested)) || requested === "remote"
       ? "companion"
-      : state.appSettingsSection;
+      : advanced && requested === "updates" ? "general" : requested;
   const dialogRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const searchFirst = useRef(advanced);
   const [query, setQuery] = useState("");
   useEffect(() => window.ogb?.environments?.onOpenSettings?.(() => setQuery("")), []);
   useEffect(() => window.ogb?.onOpenAppSettings?.(() => setQuery("")), []);
   const q = query.trim().toLowerCase();
   const ownerOrAdmin = useOwnerOrAdmin();
-  const availableSections = SECTIONS.filter((entry) => !remoteActive || entry.id === "companion" || entry.id === "appearance" || entry.id === "desktopWorkspaces")
+  const baseSections = SECTIONS.filter((entry) => !remoteActive || entry.id === "companion" || entry.id === "appearance" || entry.id === "desktopWorkspaces")
     .filter((entry) => entry.id !== "desktopWorkspaces" || Boolean(window.ogb?.environments))
-    .filter((entry) => entry.id !== "organization" || Boolean(window.ogb?.organization))
-    // the operator's screen for other workspaces exists only where a fleet agent does
+    .filter((entry) => entry.id !== "organization" || Boolean(window.ogb?.organization)).filter((entry) => entry.id !== "import" || Boolean(window.ogb))
+    .filter((entry) => entry.id !== "cloudAccount" || Boolean(window.ogb?.cloudAccount || (window.ogb?.cloudPlan && state.config?.cloudHome === true)))
     .filter((entry) => entry.id !== "workspaces" || workspacesAvailable(state.config))
-    // sign-in by email is a hosted server's; the desktop app pairs devices under Remote access
-    .filter((entry) => entry.id !== "people" || !window.ogb)
-    // the activity log belongs to a workspace served to a browser, and to its admins
-    .filter((entry) => entry.id !== "activity" || (!window.ogb && ownerOrAdmin === true));
+    .filter((entry) => entry.id !== "people" || (!window.ogb && state.config?.cloudHome !== true))
+    .filter((entry) => entry.id !== "activity" || (!window.ogb && ownerOrAdmin === true))
+    .filter((entry) => entry.id !== "botAccess" || (Boolean(state.config?.team) && ownerOrAdmin === true));
+  const availableSections = baseSections.filter((entry) => entry.id !== "skills" || skillsLibraryEnabled(state.config));
   const visibleSections = availableSections.filter((entry) => sectionMatches(entry, q));
-  const sectionLabelKey = SECTIONS.find((entry) => entry.id === section)?.labelKey;
-  const nextVisibleSection = visibleSections.some((entry) => entry.id === section) ? undefined : visibleSections[0]?.id;
+
+  const simpleAvailable = new Set<AppSettingsSection>([...availableSections.map((entry) => entry.id), ...(remoteActive ? [] : ["updates" as const])]);
+  const simplePages = advanced ? [] : simpleSettingsPages(simpleAvailable, section);
+  const visiblePages = simplePages.filter((page) => simplePageMatches(page, q));
+  const currentPage = simplePages.find((page) => page.sections.includes(section));
+
+  const sectionLabelKey = advanced
+    ? SECTIONS.find((entry) => entry.id === section)?.labelKey
+    : currentPage?.labelKey;
+  const nextVisibleSection = advanced
+    ? visibleSections.some((entry) => entry.id === section) ? undefined : visibleSections[0]?.id
+    : currentPage && visiblePages.includes(currentPage)
+      ? undefined
+      : visiblePages[0] && (visiblePages[0].sections.find((id) => visibleSections.some((entry) => entry.id === id)) ?? visiblePages[0].sections[0]);
 
   useEffect(() => {
-    // Translated matches can change without the query changing. Follow the
-    // rendered results instead of a second filter with stale effect inputs.
     if (nextVisibleSection) dispatch({ type: "toggleAppSettings", open: true, section: nextVisibleSection });
   }, [dispatch, nextVisibleSection]);
+
+  const [folds, setFolds] = useState<Partial<Record<SimpleDisclosureId, boolean>>>({});
+  const keyFocus = useKeyFocus();
+  useEffect(() => { if (keyFocus) setFolds((current) => current["ai-keys"] ? current : { ...current, "ai-keys": true }); }, [keyFocus]);
+  const disclose: Disclose = (id) => {
+    const open = q !== "" || (folds[id] ?? SIMPLE_FOLDED[requested] === id);
+    return { id, open, onToggle: () => setFolds((current) => ({ ...current, [id]: !open })) };
+  };
+  const [looks, setLooks] = useState(false);
+  const [reveal, setReveal] = useState<string | null>(null);
+  const advancedMatches = advanced || !q ? [] : SIMPLE_ADVANCED_ONLY.filter((key) => t(key).toLowerCase().includes(q));
+  const keyResults = remoteActive || !availableSections.some((entry) => entry.id === "connections") ? [] : keySearchResults(q);
+  const keyResultButtons = (className: string) => keyResults.map((entry) => (
+    <button key={entry.id} type="button" data-settings-key-result={entry.id} className={className}
+      onClick={() => { setQuery(""); setLooks(false); dispatch(openKeyResult(entry)); }}>
+      <span>{t(entry.labelKey)} <span className="text-ink-secondary">· {t(keySection(entry).titleKey)}</span></span>
+    </button>
+  ));
+
+  const sectionIndex = currentPage?.sections.indexOf(section) ?? 0;
+  const revealBlock = !advanced && requested === "remote" ? "remote" : section;
+  useEffect(() => {
+    if (scrollRef.current) revealSettingsBlock(scrollRef.current, revealBlock as AppSettingsSection, advanced ? 0 : revealBlock === section ? sectionIndex : 1);
+  }, [advanced, revealBlock, section, sectionIndex]);
+  useEffect(() => {
+    if (!reveal) return;
+    const block = scrollRef.current?.querySelector(`[data-settings-block="${reveal}"]`);
+    if (scrollRef.current && block) scrollWithin(scrollRef.current, block);
+    setReveal(null);
+  }, [reveal]);
 
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const dialog = dialogRef.current;
     const search = dialog?.querySelector<HTMLInputElement>("[data-settings-search]");
-    if (search?.checkVisibility()) search.focus();
+    if (searchFirst.current && search?.checkVisibility()) search.focus();
     else dialog?.focus();
 
     const onKey = (event: KeyboardEvent) => {
+      if (!searchFirst.current && dialog && document.activeElement === dialog && event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey
+        && search?.checkVisibility()) {
+        event.preventDefault();
+        search.focus();
+        setQuery((current) => current + event.key);
+        return;
+      }
+      // A child editor owns Escape and its focus trap, including while saving.
+      if (event.defaultPrevented || (dialog && [...dialog.querySelectorAll<HTMLElement>('[role="dialog"], [role="alertdialog"]')]
+        .some(child => child.getClientRects().length))) return;
       if (event.key === "Escape") {
         event.preventDefault();
         dispatch({ type: "toggleAppSettings", open: false });
@@ -547,193 +307,372 @@ export function SettingsModal() {
     };
   }, [dispatch]);
 
+  const openSection = (id: AppSettingsSection) => dispatch({ type: "toggleAppSettings", open: true, section: id });
+
+  const phoneFocus = state.appSettingsPhonePairing;
+  const computerPairs = currentPhonePairingTarget(state.config?.cloudHome === true) === "computer";
+  const remoteAccess = {
+    client: <RemoteComputerSection hideWhenUnavailable={!advanced} />,
+    domain: remoteActive ? null : <CustomDomainSettings />,
+    // Security: the server decides who may pair (an owner or admin session), not this gate.
+    pairing: <ServerPairingCard cloudHome={state.config?.cloudHome === true} focusRequest={computerPairs ? 0 : phoneFocus} team={state.config?.team?.name} teamPhoneBlocked={state.config?.managedPolicy?.remoteAccess === false ? t("policy.teamRemoteBlocked", { organization: state.config.managedPolicy.organizationName }) : null} simple={!advanced} />,
+    companion: remoteActive ? null : <CompanionSection profileEmail={state.config?.profile?.email} focusRequest={computerPairs ? phoneFocus : 0} />,
+  };
+
+  const renderSection = (id: AppSettingsSection) => {
+    switch (id) {
+      case "desktopWorkspaces":
+        return <ConnectedWorkspacesSettings />;
+      case "organization":
+        return window.ogb?.organization && !remoteActive ? <OrganizationSettings /> : null;
+      case "cloudAccount":
+        return (window.ogb?.cloudAccount || (window.ogb?.cloudPlan && state.config?.cloudHome === true)) && !remoteActive
+          ? <CloudAccountSettings linkRequest={state.appSettingsCloudLink} cloudHome={state.config?.cloudHome === true} teamHome={state.config?.team}
+            onConnectPhone={() => dispatch(phonePairingSettingsAction())} onAddCloud={advanced ? () => dispatch({ type: "openCloudAdd", source: "app_settings" }) : undefined}
+            onSignIn={() => dispatch({ type: "openCloudAdd", source: "app_settings", signIn: true })} />
+          : null;
+      case "general":
+        return (
+          <>
+            <AdvancedModeRow />
+            <DefaultBotSidebarRow />
+            <TalkShortcutRow />
+
+            <ProSettingsCard />
+            <CloudUsageSettings />
+            <Card title={t("settings.profile.title")} subtitle={t("settings.profile.sharedSubtitle")}>
+              <ProfileFields />
+            </Card>
+
+            <LanguageRow />
+            <OpenAtLoginRow />
+            <NewBotEffortRow />
+            <SavedStepsRow />
+            <AnalyticsRow />
+            <UpdatesConsentRow />
+            <DefaultBotSettings />
+
+            <Card title={t("settings.roomTurns.title")} subtitle={t("settings.roomTurns.subtitle")}>
+              <RoomTurnTimeoutSettings />
+            </Card>
+
+            <Card title={t("settings.mcpCalls.title")} subtitle={t("settings.mcpCalls.subtitle")}>
+              <McpCallTimeoutSettings />
+            </Card>
+            <ThreadConcurrencySettings />
+
+            <AutomaticRecoverySettings />
+            <ThreadCleanupSettings />
+            <AttachmentStorageSettings />
+            <PinnedPanelsSettings />
+
+            {!remoteActive && <ReplayTourRow />}
+            <UpdatesRow />
+            <DiagnosticsRow />
+          </>
+        );
+      case "appearance":
+        return (
+          <>
+            <ThemeRow />
+            <Card title={t("settings.skin.title")} subtitle={t("settings.skin.subtitle")}>
+              <SkinPicker />
+            </Card>
+            <PlaceLookCard />
+            {remoteActive && <AdvancedModeRow />}
+            {remoteActive && <LanguageRow />}
+            <FontRow />
+            <ChatWidthRow />
+            <ColorUserBubblesRow />
+            <SendKeyRow />
+            <FollowUpRow />
+            <SidebarToolsLayoutRow />
+            <ChromeRailRow />
+            <WindowFrameRow />
+            <ShowThreadsRow />
+            <PinnedCirclesRow />
+            <UniversalPinsRow />
+            <NotificationRows />
+            {!remoteActive && <ToolCallsRow />}
+            <RunCardRow />
+          </>
+        );
+      case "experimental":
+        return <ExperimentalFeaturesRow />;
+      case "connections":
+        return <AdminOnly><KeysPage /></AdminOnly>;
+      case "decisionModel": return <AdminOnly><DecisionModelSettings /></AdminOnly>;
+      case "engines": return <AdminOnly><EnginesSettings /></AdminOnly>;
+      case "backups": return <AdminOnly><WorkspaceBackupSettings /><CompanyBackupSettings /></AdminOnly>;
+      case "import": return <AdminOnly><ImportSettings /></AdminOnly>;
+      case "companion":
+        return <>{remoteAccess.client}{remoteAccess.domain}{remoteAccess.pairing}{remoteAccess.companion}</>;
+      case "computer":
+        return <><BuiltInBrowserRow /><BrowserProfilesRow /><AdminOnly><LocalComputerSection /></AdminOnly></>;
+      case "logins":
+        return <LoginsSettings />;
+      case "usage":
+        return <AdminOnly note="settings.adminOnly.usage"><UsageSection /></AdminOnly>;
+      case "skills":
+        return skillsLibraryEnabled(state.config) ? <SkillsSection /> : null;
+      case "people":
+        return <PeopleSection />;
+      case "activity":
+        return <ActivitySection />;
+      case "botAccess":
+        return <AccessOverview />;
+      case "workspaces":
+        return <WorkspacesSection />;
+      default:
+        return null;
+    }
+  };
+
+  const renderSimplePage = (page: SimpleSettingsPage) => {
+    const has = (id: AppSettingsSection) => page.sections.includes(id);
+    switch (page.id) {
+      case "general": return looks
+        ? <SimpleLooksPage onBack={() => { setLooks(false); setReveal("appearance"); }} />
+        : <SimpleGeneralPage has={has} peopleOpen={section === "people"} onLooks={() => setLooks(true)} />;
+      case "ai": return <SimpleAiPage has={has} disclose={disclose} connections={renderSection("connections")} />;
+      case "computer": return <SimpleComputerPage has={has} remoteAccess={remoteAccess} servers={renderSection("desktopWorkspaces")} disclose={disclose} />;
+      case "billing": return <SimpleBillingPage has={has} disclose={disclose} cloudAccount={renderSection("cloudAccount")} />;
+      case "updates": return <SimpleUpdatesPage remoteActive={remoteActive} />;
+      default:
+        return page.sections.map((id) => <section key={id} data-settings-block={id} className="flex scroll-mt-4 flex-col gap-4">{renderSection(id)}</section>);
+    }
+  };
+
+  const close = () => dispatch({ type: "toggleAppSettings", open: false });
+  const searchField = (className: string, inputClassName: string) => (
+    <div className={className}>
+      <Search size={15} aria-hidden="true" className="shrink-0 text-ink-secondary" />
+      <input
+        data-settings-search
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key !== "Escape") return;
+          e.stopPropagation();
+          if (query) setQuery("");
+          else close();
+        }}
+        placeholder={t("settings.search")}
+        aria-label={t("settings.searchAria")}
+        className={inputClassName}
+      />
+    </div>
+  );
+
+  if (!advanced) {
+    const looksOpen = looks && currentPage?.id === "general";
+    const goTo = (id: AppSettingsSection) => { setLooks(false); openSection(id); };
+    return (
+      <div
+        className="glass-popup-frame"
+        data-settings-sheet
+        data-settings-look="simple"
+        style={glassPopupFrameStyle()}
+        onMouseDown={(e) => e.target === e.currentTarget && close()}
+      >
+        <div aria-hidden="true" className="glass-scrim pointer-events-none absolute inset-0" />
+        <div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="app-settings-title"
+          tabIndex={-1}
+          style={{ outline: "none" }}
+          className="glass-surface glass-popup animate-pop-in relative flex overflow-hidden rounded-2xl text-ink"
+        >
+          <span id="app-settings-title" className="sr-only">{t("settings.title")}</span>
+          <nav aria-label={t("settings.title")} className="glass-rail hidden min-h-0 w-[198px] shrink-0 flex-col gap-0.5 overflow-y-auto px-3 py-4 sm:flex">
+            {searchField(
+              "mb-2 flex h-8 shrink-0 items-center gap-2 rounded-lg bg-ink/[0.05] px-[9px] text-[13px] focus-within:ring-2 focus-within:ring-focus/60",
+              "w-full min-w-0 bg-transparent text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none",
+            )}
+            {visiblePages.length === 0 && advancedMatches.length === 0 && keyResults.length === 0 && (
+              <div className="px-[9px] py-3 text-[13px] leading-[18px] text-ink-secondary">{t("settings.noMatch", { query: query.trim() })}</div>
+            )}
+            {visiblePages.map((page) => {
+              const Icon = page.icon;
+              const current = page === currentPage;
+              return (
+                <button
+                  key={page.id}
+                  type="button"
+                  data-settings-page={page.id}
+                  onClick={() => goTo(page.sections[0]!)}
+                  aria-current={current ? "page" : undefined}
+                  className={cn(
+                    "flex h-8 shrink-0 cursor-pointer items-center gap-[9px] rounded-lg px-[9px] text-left text-[13px] text-ink transition-colors motion-reduce:transition-none",
+                    current ? "bg-ink/[0.08]" : "hover:bg-ink/[0.06]",
+                  )}
+                >
+                  <Icon size={15} aria-hidden="true" className="shrink-0" />
+                  <span className="truncate">{t(page.labelKey)}</span>
+                </button>
+              );
+            })}
+            {advancedMatches.map((key) => (
+              <button
+                key={key}
+                type="button"
+                data-settings-advanced-only={key}
+                onClick={() => { setQuery(""); goTo("general"); setReveal("advanced-mode"); }}
+                className="flex min-h-8 shrink-0 cursor-pointer items-center rounded-lg px-[9px] py-1.5 text-left text-[13px] leading-[18px] text-ink transition-colors hover:bg-ink/[0.06] motion-reduce:transition-none"
+              >
+                <span>{t(key)} <span className="text-ink-secondary">· {t("settings.simple.advanced")}</span></span>
+              </button>
+            ))}
+            {keyResultButtons("flex min-h-8 shrink-0 cursor-pointer items-center rounded-lg px-[9px] py-1.5 text-left text-[13px] leading-[18px] text-ink transition-colors hover:bg-ink/[0.06] motion-reduce:transition-none")}
+          </nav>
+
+          <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+            <header className="flex shrink-0 items-center gap-3 py-3 pl-4 pr-14 sm:pb-1.5 sm:pl-12 sm:pt-8">
+              <Select className="min-w-0 sm:hidden"
+                aria-label={t("settings.title")}
+                value={currentPage?.id ?? ""}
+                onChange={(event) => {
+                  setQuery("");
+                  const page = simplePages.find((candidate) => candidate.id === event.target.value);
+                  if (page) goTo(page.sections[0]!);
+                }}
+              >
+                {simplePages.map((page) => (
+                  <option key={page.id} value={page.id}>{t(page.labelKey)}</option>
+                ))}
+              </Select>
+              <h2 className="hidden truncate text-[17px] font-medium leading-6 tracking-[-0.008em] text-ink sm:block">
+                {looksOpen ? t("settings.simple.page.looks") : currentPage ? t(currentPage.labelKey) : null}
+              </h2>
+            </header>
+            <button
+              type="button"
+              onClick={close}
+              aria-label={t("settings.close")}
+              title={`${t("settings.close")} (${shortcutLabel("close-panel")})`}
+              className="absolute right-3 top-3 flex size-8 cursor-pointer items-center justify-center rounded-full text-ink-secondary transition-colors hover:bg-ink/[0.06] hover:text-ink motion-reduce:transition-none"
+            >
+              <X size={16} aria-hidden="true" />
+            </button>
+
+            <div
+              ref={scrollRef}
+              data-settings-scroll
+              className={cn(
+                "flex min-h-0 flex-1 flex-col gap-7 overflow-y-auto px-4 pb-8 pt-4 sm:px-8 sm:pb-7 sm:pt-[22px]",
+                SIMPLE_BUTTONS,
+                "[&_.uppercase]:normal-case [&_.uppercase]:tracking-normal",
+              )}
+            >
+              <LicenseExpiryBanner config={state.config} />
+              {currentPage ? renderSimplePage(currentPage) : null}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-3 sm:p-6"
-      onMouseDown={(e) => e.target === e.currentTarget && dispatch({ type: "toggleAppSettings", open: false })}
+      className="glass-popup-frame"
+      data-settings-sheet
+      data-settings-look="advanced"
+      style={glassPopupFrameStyle()}
+      onMouseDown={(e) => e.target === e.currentTarget && close()}
     >
+      {/* A sibling, not the parent: a backdrop-filter on an ancestor would stop the pop-up's own glass from seeing the app behind it. */}
+      <div aria-hidden="true" className="glass-scrim pointer-events-none absolute inset-0" />
       <div
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="app-settings-title"
         tabIndex={-1}
-        className={cn("flex max-h-[calc(100dvh-24px)] w-full overflow-hidden rounded-2xl border border-hairline/50 bg-panel shadow-2xl outline-none", section === "engines" ? "h-[720px] max-w-[1040px]" : "h-[560px] max-w-[860px]")}
+        className="glass-surface glass-popup animate-pop-in relative flex overflow-hidden rounded-2xl outline-none"
       >
-        {/* section nav */}
         <span id="app-settings-title" className="sr-only">{t("settings.title")}</span>
-        <nav className="hidden min-h-0 w-[190px] shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-app/30 p-3 sm:flex">
+        <nav className="glass-rail hidden min-h-0 w-[200px] shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/30 p-3 sm:flex">
           <div className="shrink-0 px-2 py-3 text-[15px] font-semibold text-ink">
             {t("settings.title")}
           </div>
-          <div className="mb-2 mt-1 flex min-h-8 shrink-0 items-center gap-2 rounded-lg border border-transparent bg-control/70 px-2.5 py-2 focus-within:border-focus">
-            <Search size={14} className="shrink-0 text-ink-secondary" />
-            <input
-              data-settings-search
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key !== "Escape") return;
-                e.stopPropagation();
-                if (query) setQuery("");
-                else dispatch({ type: "toggleAppSettings", open: false });
-              }}
-              placeholder={t("settings.search")}
-              aria-label={t("settings.searchAria")}
-              className="w-full bg-transparent text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none"
-            />
-          </div>
+          {searchField(
+            "mb-2 mt-1 flex h-8 shrink-0 items-center gap-2 rounded-lg bg-ink/[0.05] px-[9px] text-[13px] focus-within:ring-2 focus-within:ring-focus/60",
+            "w-full min-w-0 bg-transparent text-[13px] text-ink placeholder:text-ink-tertiary focus:outline-none",
+          )}
           {visibleSections.length === 0 && (
-            <div className="px-2.5 py-4 text-[12.5px] leading-relaxed text-ink-secondary">
+            <div className="px-2.5 py-4 text-[13px] leading-relaxed text-ink-secondary">
               {t("settings.noMatch", { query: query.trim() })}
             </div>
           )}
-          {visibleSections.map(({ id, labelKey, icon: Icon }) => (
-            <button
-              key={id}
-              onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: id })}
-              aria-current={section === id ? "page" : undefined}
-              className={cn(
-                "flex min-h-9 items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] transition-colors motion-reduce:transition-none",
-                section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
-              )}
-            >
-              <Icon size={15} className="shrink-0" />
-              {t(labelKey)}
-            </button>
-          ))}
+          {SETTINGS_GROUPS.map((group) => {
+            const entries = visibleSections.filter((entry) => entry.group === group.id);
+            if (entries.length === 0) return null;
+            return (
+              <div key={group.id} role="group" aria-labelledby={`settings-group-${group.id}`} data-settings-group={group.id} className="flex flex-col gap-0.5 pb-2">
+                <div id={`settings-group-${group.id}`} className="px-[9px] pb-1 pt-2 text-[12px] font-medium leading-4 text-ink-tertiary">
+                  {t(group.labelKey)}
+                </div>
+                {entries.map(({ id, labelKey, icon: Icon }) => (
+                  <button
+                    key={id}
+                    data-settings-section={id}
+                    onClick={() => openSection(id)}
+                    aria-current={section === id ? "page" : undefined}
+                    className={cn(
+                      "flex h-8 shrink-0 cursor-pointer items-center gap-[9px] rounded-lg px-[9px] text-left text-[13px] text-ink transition-colors motion-reduce:transition-none",
+                      section === id ? "bg-ink/[0.08]" : "hover:bg-ink/[0.06]",
+                    )}
+                  >
+                    <Icon size={15} className="shrink-0" />
+                    {t(labelKey)}
+                  </button>
+                ))}
+              </div>
+            );
+          })}
+          {keyResultButtons("cursor-pointer flex min-h-9 items-center rounded-lg px-2.5 py-2 text-left text-[13px] text-ink transition-colors hover:bg-control/50 motion-reduce:transition-none")}
         </nav>
 
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <div className="flex shrink-0 items-center justify-between gap-3 border-b border-hairline/30 px-3 py-3 sm:px-5">
-            <select
+          <div className="flex shrink-0 items-center justify-between gap-3 border-b border-hairline/30 px-3 py-3 sm:pl-9">
+            <Select className="min-w-0 sm:hidden"
               aria-label={t("settings.title")}
               value={section}
               onChange={(event) => {
                 setQuery("");
-                dispatch({ type: "toggleAppSettings", open: true, section: event.target.value as AppSettingsSection });
+                openSection(event.target.value as AppSettingsSection);
               }}
-              className="min-w-0 rounded-lg bg-control px-3 py-2 text-[14px] text-ink sm:hidden"
             >
-              {availableSections.map(({ id, labelKey }) => (
-                <option key={id} value={id}>{t(labelKey)}</option>
-              ))}
-            </select>
+              {SETTINGS_GROUPS.map((group) => {
+                const entries = availableSections.filter((entry) => entry.group === group.id);
+                return entries.length === 0 ? null : (
+                  <optgroup key={group.id} label={t(group.labelKey)}>
+                    {entries.map(({ id, labelKey }) => (
+                      <option key={id} value={id}>{t(labelKey)}</option>
+                    ))}
+                  </optgroup>
+                );
+              })}
+            </Select>
             <span className="hidden text-[15px] font-semibold text-ink sm:block">
               {sectionLabelKey ? t(sectionLabelKey) : null}
             </span>
             <button
-              onClick={() => dispatch({ type: "toggleAppSettings", open: false })}
+              onClick={close}
               aria-label={t("settings.close")}
               title={`${t("settings.close")} (${shortcutLabel("close-panel")})`}
-              className="ui-icon-button shrink-0"
+              className="ui-icon-button cursor-pointer shrink-0 max-md:size-9 max-md:rounded-full max-md:border max-md:border-hairline max-md:bg-card"
             >
               <X size={18} />
             </button>
           </div>
 
-          <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-4 sm:px-5 sm:pb-5">
-            {section === "desktopWorkspaces" && <ConnectedWorkspacesSettings />}
-            {section === "organization" && window.ogb?.organization && !remoteActive && <OrganizationSettings />}
-            {section === "general" && (
-              <>
-                <Card title={t("settings.profile.title")} subtitle={t("settings.profile.subtitle")}>
-                  <ProfileFields />
-                </Card>
-                <div>
-                  <LanguageRow />
-                  <AnalyticsRow />
-                </div>
-                <Card title={t("settings.roomTurns.title")} subtitle={t("settings.roomTurns.subtitle")}>
-                  <RoomTurnTimeoutSettings />
-                </Card>
-                <ThreadConcurrencySettings />
-                <ThreadCleanupSettings />
-                <div>
-                  {!remoteActive && <ReplayTourRow />}
-                  <UpdatesRow />
-                  <DiagnosticsRow />
-                </div>
-              </>
-            )}
-
-            {section === "appearance" && (
-              <>
-                <Card title={t("settings.skin.title")} subtitle={t("settings.skin.subtitle")}>
-                  <SkinPicker />
-                </Card>
-                <div>
-                  <ShowThreadsRow />
-                  {!remoteActive && <ToolCallsRow />}
-                </div>
-              </>
-            )}
-
-            {section === "experimental" && (
-              <>
-                <ExperimentalFeaturesRow />
-                <BrowserProfilesRow />
-              </>
-            )}
-
-            {section === "connections" && (
-              <Card
-                title={t("settings.connections.title")}
-                subtitle={t("settings.connections.subtitle")}
-              >
-                <div className="flex flex-col gap-4">
-                  {state.config?.composio.mode === "managed" ? (
-                    <div className="rounded-lg border border-success/25 bg-success/10 px-3 py-2 text-[13px] text-success">
-                      {t("settings.connections.ready")}
-                    </div>
-                  ) : null}
-                  <div className="text-[11.5px] font-medium uppercase tracking-wide text-ink-secondary">{t("keys.providers.title")}</div>
-                  <p className="-mt-3 text-[12px] leading-relaxed text-ink-secondary">{t("keys.providers.subtitle")}</p>
-                  <ApiKeyRow section="anthropic" testProvider="anthropic" />
-                  <ApiKeyRow section="openaiCompat" testProvider="openaiCompat" />
-                  <OpenAiCompatUrl />
-                  <ApiKeyRow section="xai" testProvider="xai" />
-                  <div className="pt-2 text-[11.5px] font-medium uppercase tracking-wide text-ink-secondary">{t("keys.integrations.title")}</div>
-                  <ApiKeyRow section="box" />
-                  <VpsConnection />
-                  <ApiKeyRow section="opencodeGo" />
-                  <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
-                    <summary className="cursor-pointer text-[13px] text-ink-secondary">{t("settings.connections.selfHost")}</summary>
-                    <div className="mt-3">
-                      <ApiKeyRow section="composio" />
-                    </div>
-                  </details>
-                </div>
-              </Card>
-            )}
-
-            {section === "engines" && (
-              <EnginesSettings />
-            )}
-
-            {section === "backups" && <><WorkspaceBackupSettings /><CompanyBackupSettings /></>}
-
-            {section === "companion" && (
-              <>
-                <RemoteComputerSection />
-                {!remoteActive && <CustomDomainSettings />}
-                {/* mints an admin/client session token for anything that isn't the phone companion
-                    flow (MCP clients, `openmausbot pair`, a second desktop app), and pairs phones to a
-                    hosted server. Shown for the desktop app's own server (#950) AND when this desktop is
-                    a remote client of a hosted workspace: its requests carry that server's session, and
-                    Settings there is the only place that server's phones can be paired from (MOCA-84).
-                    The server decides who may act — an owner or an admin session — not this gate. */}
-                <ServerPairingCard />
-                {!remoteActive && <CompanionSection profileEmail={state.config?.profile?.email} />}
-              </>
-            )}
-
-            {section === "computer" && <LocalComputerSection />}
-
-            {section === "usage" && <UsageSection />}
-            {section === "people" && <PeopleSection />}
-            {section === "activity" && <ActivitySection />}
-            {section === "workspaces" && <WorkspacesSection />}
+          <div ref={scrollRef} className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-4 sm:px-5 sm:pb-5">
+            <LicenseExpiryBanner config={state.config} />
+            {renderSection(section)}
           </div>
         </div>
       </div>

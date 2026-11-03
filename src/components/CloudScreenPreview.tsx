@@ -3,7 +3,6 @@ import { Loader2, Maximize2, Monitor } from "lucide-react";
 
 import { t } from "@/lib/i18n";
 
-/** A connection is only visible once the browser has decoded its first frame. */
 export function CloudScreenPreview({ src, name, error, starting, opening, disabled, refreshing = false, retry = 0, onOpen, onRetry }: {
   src: string | null;
   name: string;
@@ -65,7 +64,7 @@ export function CloudScreenPreview({ src, name, error, starting, opening, disabl
         <div role="alert" className={`absolute inset-x-0 flex flex-col items-center justify-center gap-2 bg-card/95 p-4 text-center text-[12px] text-ink-secondary ${visible ? "bottom-0" : "inset-y-0"}`}>
           {!visible && <Monitor size={22} />}
           <span>{visible ? t("computer.preview.paused") : t("computer.preview.cantConnect")} {problem}</span>
-          <button type="button" onClick={() => onRetry(!visible)} className="rounded-md bg-control px-3 py-1.5 text-ink hover:bg-control-hover">
+          <button type="button" onClick={() => onRetry(!visible)} className="rounded-md bg-control px-3 py-1.5 text-ink hover:bg-raised-hover">
             {t("computer.preview.retry")}
           </button>
         </div>

@@ -89,6 +89,11 @@ What the screenshot looks like when the recipe passes (`evidence/chat-ui/chat-ui
 
 The permanent form of this recipe is `scripts/testing/control-omb-ui.e2e.test.ts`:
 
+The fixture also hit-tests the rendered empty band beside **This run**. It
+must target the conversation rather than the transparent dock, while points
+inside the card and composer still target those controls. This checks browser
+pointer targeting, not native OS wheel delivery.
+
 ```sh
 OMB_UI_E2E=1 pnpm exec vitest run scripts/testing/control-omb-ui.e2e.test.ts
 ```
@@ -118,7 +123,7 @@ real fixture health check and verifies that clicking a deliberately missing
 control fails. The card remains collapsible; the old execution timeline is no
 longer shown above chat.
 
-For activity detail, click **Inspector → Run Log**. It shows the selected
+For activity detail, click **More → Inspector → Run Log**. It shows the selected
 conversation's recorded commands, statuses and timestamps; command previews
 may be shortened. **Events** and **Raw** retain the underlying technical views.
 The recipe checks tab switching and saves `run-log.png` alongside `chat-ui.png`.
@@ -127,10 +132,53 @@ not chat text or raw protocol data. Review copied logs before sharing: automatic
 redaction is best effort. Neither this log nor a successful command proves an
 unasserted user outcome.
 
+`scripts/testing/usage-details-ui.e2e.test.ts` checks the header's **More** menu,
+usage breakdown, clipboard success and refusal, and responsive geometry at
+390, 800, 1100 and 1600 px. It checks that opening bot settings folds the sidebar
+without changing its saved density and closing settings restores it. Evidence
+includes screenshots and a `.usage-details.json` next to the fixture log.
+These are renderer checks, not native Windows caption-button verification.
+
 It runs when an agent-browser binary resolves and is skipped with a printed
 reason otherwise; `OMB_UI_E2E=1` forces the verified download. The `ui-smoke`
 job in `.github/workflows/ci.yml` runs it on Ubuntu 24.04 and uploads the
 screenshot; it is not one of the required checks.
+
+## Mobile text and code blocks
+
+```sh
+OMB_UI_E2E=1 pnpm exec vitest run scripts/testing/mobile-code-blocks-ui.e2e.test.ts
+pnpm exec vitest run src/components/ChatMarkdown.block-actions.test.ts src/components/ChatMarkdown.test.ts src/lib/copy-text.test.ts
+```
+
+The browser recipe sends a synthetic reply through a disposable fake-engine
+server and renders it in the real chat. Its five blocks cover plaintext,
+highlighted code, an unknown language, an omitted language, and indented code.
+Copy preserves only the selected block's text, including whitespace; Wrap and
+Unwrap affect only that block and leave the copied source unchanged.
+
+At narrow widths and on coarse-pointer or no-hover devices, the labeled actions
+occupy their own row with at least 44px touch targets. Check 320px and 390px
+portrait, landscape and tablet widths, and a desktop with a fine pointer.
+Long tokens must wrap within the bubble when Wrap is selected; unwrapped code
+can scroll horizontally inside its block without widening the page. Copy keeps
+a stable mobile label while its icon shows success or failure; a persistent
+live region exposes the feedback to assistive technology. Keyboard focus has
+an outline.
+
+A hosted Linux runner has no mouse, so its headless Chrome reports no hover.
+The recipe starts Chrome with a fine, hovering pointer and runs the desktop
+pass before touch emulation starts: once touch emulation is switched on or
+off, Chrome goes back to the host's own pointer.
+
+This is mobile web renderer coverage in an isolated Chromium profile. It does
+not verify the separately maintained native iOS or Android clients, physical
+devices, or Safari. Clipboard permissions are confined to the fixture origin;
+the refusal case replaces only that disposable page's clipboard writer.
+
+| Before: small icon-only actions | After: labeled touch controls |
+| --- | --- |
+| ![Before at 390px](assets/mobile-code-blocks/before-390.png) | ![After at 390px](assets/mobile-code-blocks/after-390.png) |
 
 ## Thinking timer across thread switches
 
@@ -163,29 +211,65 @@ keeping a second screenshot.
 OMB_UI_E2E=1 pnpm exec vitest run scripts/testing/thinking-timer-ui.e2e.test.ts
 ```
 
-## Paused-frame stream buffering
+## In-flight reply text
 
-`scripts/testing/stream-buffer.e2e.test.ts` launches the same isolated server,
-Vite and disposable browser session, mounting the real `StoreProvider` with a
-fixture-only text/reasoning probe. It pauses `requestAnimationFrame`, sends
-through the shared control surface, and holds the fake CLI's final frames
-until both intermediate channels reach the renderer. After settlement it
-asserts exactly one complete reply and empty stream channels, including after
-the fallback timer could fire. This probes state; the current app's active-turn
-tail displays presence rather than partial text/reasoning.
+The desktop shows a reply once it is finished; while a turn runs, the chat
+shows the bot's busy state. The renderer keeps no streamed text:
+`runtimeFrameAction` in `src/state/store.tsx` passes only the model-variant
+frames on, and `src/state/store.test.ts` checks that a reply or reasoning
+delta leaves the store state unchanged. `src/components/ChatView.follow.test.ts`
+checks that the finished reply still moves a following transcript to its end.
 
 ```sh
-OMB_UI_E2E=1 pnpm exec vitest run scripts/testing/stream-buffer.e2e.test.ts
-pnpm exec vitest run src/state/store.test.ts
+pnpm exec vitest run src/state/store.test.ts src/components/ChatView.follow.test.ts
 ```
 
-Only the **pending buffer** is drained: once per frame, after 100ms when timers
-run, or at 64 × 1024 UTF-16 characters (not bytes). The size test also pauses
-timers and proves an oversized chunk is flushed intact. Total accumulated
-output is intentionally unbounded; no output is truncated and this is not a
-hard memory cap. Fully suspended browser execution cannot run either callback.
-The fixture prints a persistent `.stream.json` evidence path after closing its
-browser and server and removing its temporary data.
+## What a bot is doing right now
+
+While a step runs, the working line names it ("Running scrape.py", "Searching the
+web for “Acme construction leads”", "Reading linkedin.com"), with the whole command on
+hover. Once the step has run past the quiet notice it adds how it is doing: the
+time since its last output, or what its own processes show ("waiting on the
+network", "busy, no output yet", "idle, no output yet"). A click on the line,
+or Enter on it, unfolds the **Now** card: the current ask's steps, a running
+command's last lines of output and **Open activity**, which opens the Activity
+panel at this run. A second click or Escape folds it. A working bot's sidebar
+row shows the same step in place of its last message.
+
+A scripted call with `hold` stays running until `FAKE_CLAUDE_RELEASE` exists;
+`hold: "busy"`, `"idle"` or `"network"` also keeps a stand-in process that
+burns CPU, sleeps or holds a loopback connection, as the call's command would.
+The quiet-status knobs cross into the fixture, so the sign of life shows in
+seconds:
+
+```sh
+OMB_ACP_QUIET_NOTICE_MS=10000 OMB_ACP_QUIET_TICK_MS=2000 FAKE_CLAUDE_RELEASE=/tmp/release \
+node --experimental-strip-types scripts/control-omb.ts ui launch --tool-calls \
+  '[{"name":"WebSearch","input":{"query":"Acme construction leads"},"ok":true},
+    {"name":"Bash","input":{"command":"cd ~/acme && python3 scrape.py --pages 40"},"hold":"busy"}]'
+```
+
+Expected after a sent message: `Working · 15s · Running scrape.py · busy, no
+output yet`, the button `What Pepper is doing` with `aria-expanded="false"`,
+and, once clicked, a card listing `Searched the web for “Acme construction leads”` and
+`Running scrape.py`. Claude Code prints a command's output only when it ends,
+so streamed output needs an engine that sends it: `--engine codex` adds the
+fake Codex app-server, and `FAKE_CODEX_COMMAND`, `FAKE_CODEX_COMMAND_OUTPUT`
+(JSON chunks), `FAKE_CODEX_COMMAND_OUTPUT_MS` and `FAKE_CODEX_COMMAND_GATE`
+script its command. A bot moved to the `codex` instance then shows `last
+output just now` and the command's last two lines in the card.
+
+The before-and-after screenshots were removed because they showed real example
+data; run the `scripts/control-omb.ts ui launch` command above to see the
+working line and the Now card.
+
+The checks are `server/step-summary.test.ts` (the words and their redaction),
+`server/harness/live-steps.test.ts` and `server/harness/bus.test.ts` (one path
+for every engine, the sign of life, the output's last lines),
+`server/bot-visibility.test.ts` (a step reaches only someone who may see the
+chat), `src/components/TurnPresence.test.ts`,
+`src/components/ChatView.live-status.test.ts` (the line and the card) and
+`src/components/Sidebar.simple-mode.test.ts` (the sidebar row).
 
 ## Bot setup and MCP access recipe
 
@@ -193,7 +277,7 @@ browser and server and removing its temporary data.
 optional `OMB_UI_E2E=1` gate. It verifies profile-only role creation, closing
 and reopening the dialog during a slow creation without duplicate submissions, recovery
 when the preset PATCH fails after creation, the composer’s Tools shortcut,
-optional setup ideas, Paste config importing disabled servers, refreshed
+optional setup ideas, a pasted config added from Add MCP server that stays off when it doesn't answer, refreshed
 per-bot MCP switches and saved opt-outs, and modal Tab/Escape containment.
 The MCP command is an inert fixture command; no real accounts are connected.
 The advisory renderer job runs both recipes. Runtime mounting, direct/channel
@@ -207,6 +291,18 @@ until agent-browser no longer lists it), then the preview, then the fixture,
 and removes only its data directory; the server log stays at the printed path
 and the tools directory keeps the downloads. Every verb refuses a handle whose
 launch has stopped.
+
+## Queued edits and Claude update recovery
+
+The queued-message Edit action must remove the server's held send before
+returning its text to the same thread's draft, ahead of any existing text.
+To exercise the desktop Claude update card without an actual provider,
+launch an isolated UI with `FAKE_CLAUDE_MODE=api-error` and
+`FAKE_CLAUDE_API_ERROR="API Error: 400 Claude Code 2.1.268 does not support this model; version 2.1.280 or newer is required."`.
+Send one short message, then click **Update Claude for me**. The fake updater
+must report its synthetic version and the card must offer **Retry**, even
+when a digest follows the error. This proves the update request and recovery
+UI, not a real Claude installation or a successful provider retry.
 
 ## What this proves, and what it does not
 

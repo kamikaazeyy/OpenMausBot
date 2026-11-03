@@ -20,20 +20,29 @@ node --experimental-strip-types scripts/verify-qwen-models.ts
 The script owns a disposable server through the standard launcher, installs a
 synthetic Qwen CLI only in that temporary home, selects another provider and
 another endpoint, and verifies the ACP calls precede the prompt. An acknowledged
-but unchanged selection must not send a prompt. A second turn on the same
-thread must ride the same agent process — the synthetic CLI reports its pid and
-RPC log, so the check pins one `initialize`, one `session/new`, one
-`session/load` (the harness rotates the agents bearer token every turn, so the
-second turn re-establishes the native session with fresh credentials on the
-same process), and two `session/prompt` calls. When the pooled agent refuses
-`session/load` of its own live session, OMB closes the child and pays the
-handshake once on a fresh process, then loads the conversation there: the pid
-must change, `initialize` is two, `session/new` stays at one (first turn only),
-`session/load` is two (the refused call plus the successful replacement), and
-`session/prompt` remains two. JSON includes resulting messages and the
+but unchanged selection must not send a prompt.
+
+The synthetic CLI also reproduces Qwen's live-session cache: `session/load`
+acknowledges the request while retaining the original MCP credentials. The
+fixture calls the real agents proxy's `list_bots` and `session_search` tools on
+three turns on one conversation. OMB keeps the agents bearer across turns
+while the grants are unchanged, so Qwen keeps one child and its live session.
+The pid stays the same; the aggregate RPC log contains one `initialize`, one
+`session/new`, no `session/load`, and three `session/prompt` calls. The process
+confirms the selected endpoint before its first prompt, and each turn's
+credential returns HTTP 401 once the turn settles. The ACP unit checks
+separately cover a fresh Qwen process when its MCP configuration changes,
+process reuse when it is unchanged, and same-process reloads for engines that
+support them. JSON includes resulting messages and the
 launcher's persistent log path. The server and temporary home are cleaned up
 on completion. This proves OMB's integration contract, not real provider auth
 or a paid model response.
+
+Last exercised: 2026-10-04, isolated macOS fixture. All three turns settled
+with six successful roster calls, three history searches, one process id, one
+agents bearer, and three HTTP 401 checks after the turns settled. The
+alternate-provider, alternate-endpoint, and rejected-switch checks also passed.
+No live provider or user workspace was used.
 
 Route identity follows Qwen Code's
 [ACP model utility](https://github.com/QwenLM/qwen-code/blob/main/packages/cli/src/utils/acpModelUtils.ts)

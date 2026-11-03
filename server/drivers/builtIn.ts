@@ -1,8 +1,5 @@
-// Built-in driver registration — upstream builtInDrivers.ts: a static
-// array, nothing more. Adding a driver = write drivers/<x>.ts, append.
 import type { AnyProviderDriver } from "../contracts.ts";
 import { AntigravityDriver } from "./antigravity.ts";
-import { BoxAgentDriver } from "./boxagent.ts";
 import { ClaudeDriver } from "./claude.ts";
 import { CodexDriver } from "./codex.ts";
 import { GrokDriver } from "./grok.ts";
@@ -15,8 +12,17 @@ import { OpenCodeDriver } from "./acp/opencode-go.ts";
 import { QwenAgentDriver } from "./acp/qwen.ts";
 import { CustomAcpDriver } from "./acp/custom.ts";
 import { HermesAgentDriver } from "./acp/hermes.ts";
+import { DeepSeekAgentDriver } from "./acp/deepseek.ts";
+import { ClineAgentDriver } from "./acp/cline.ts";
+import { CopilotAgentDriver } from "./acp/copilot.ts";
 import { OpenAICompatDriver } from "./openai-compat.ts";
 import { PiDriver } from "./pi.ts";
+import { MistralDriver } from "./mistral.ts";
+import { CerebrasDriver } from "./cerebras.ts";
+import { GroqDriver } from "./groq.ts";
+import { GreenferenceDriver } from "./greenference.ts";
+import { MetaDriver } from "./meta.ts";
+import { MuseCodeDriver } from "./muse-code.ts";
 import { MinimaxDriver } from "./minimax.ts";
 import { PaseoRelayDriver } from "./paseo-relay.ts";
 
@@ -30,6 +36,8 @@ export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
   OpenCodeDriver,
   QwenAgentDriver,
   HermesAgentDriver,
+  ClineAgentDriver,
+  CopilotAgentDriver,
   CustomAcpDriver,
   PiDriver,
   OpenAICompatDriver,
@@ -37,6 +45,12 @@ export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
   ClaudeDriver,
   CodexDriver,
   AntigravityDriver,
-  BoxAgentDriver,
   MinimaxDriver,
+  MistralDriver,
+  CerebrasDriver,
+  GroqDriver,
+  GreenferenceDriver,
+  MetaDriver,
+  MuseCodeDriver,
+  DeepSeekAgentDriver,
 ];

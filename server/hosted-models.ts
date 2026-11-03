@@ -2,6 +2,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { writeFileAtomic } from "./atomic.ts";
+import { cloudHomeConfigured } from "./cloud-home.ts";
 import { hostedWorkspaceConfiguration } from "./enterprise.ts";
 import type { InstanceConfigMap, ModelSelection, ProviderInstance } from "./contracts.ts";
 import type { Store } from "./store.ts";
@@ -19,13 +20,13 @@ const catalogSchema = z.object({
 type HostedCatalog = z.infer<typeof catalogSchema>;
 const providerFor = { claude: "anthropic", codex: "openai", opencode: "openrouter" } as const;
 
-/** Operator-only policy. An ordinary desktop has neither input and keeps its
- * personal providers. Partial policy configuration must never enable them. */
+/** Operator-only: partial policy configuration must never enable it, and a Cloud home ignores it. */
 export function hostedModelPolicy(dataDirectory: string, env: NodeJS.ProcessEnv = process.env) {
   if (env.OMB_HOSTED_MODELS === undefined && env.OMB_HOSTED_MODEL_TOKEN === undefined) return null;
+  if (cloudHomeConfigured(env)) return null;
   const hosted = hostedWorkspaceConfiguration(env);
   if (!hosted?.portalMembership || env.OMB_DESKTOP_PARENT === "1" || !/^omb_workspace_[A-Za-z0-9_-]{43}$/.test(env.OMB_HOSTED_MODEL_TOKEN ?? "")) {
-    throw new Error("Hosted model access requires complete portal-managed workspace configuration.");
+    throw new Error("Hosted model access requires complete portal-managed configuration.");
   }
   let catalog: HostedCatalog;
   try {
@@ -44,8 +45,6 @@ export function hostedModelPolicy(dataDirectory: string, env: NodeJS.ProcessEnv 
     if (["opencode", "opencodeGo"].includes(selection.instanceId) && selection.model.startsWith("omb-managed-openrouter/")) {
       return { instanceId: "opencode", model: selection.model.slice("omb-managed-openrouter/".length) };
     }
-    // This stable ID now uses the replay-based OpenAI-compatible driver,
-    // which supports neither OpenCode variants nor native effort levels.
     if (selection.instanceId === "opencode") return { instanceId: "opencode", model: selection.model };
     return selection;
   };
@@ -76,9 +75,7 @@ export function hostedModelPolicy(dataDirectory: string, env: NodeJS.ProcessEnv 
     error: () => Object.values(catalog).some(models => models.length) ? HOSTED_MODEL_SELECTION_ERROR : HOSTED_MODEL_SETUP_ERROR,
     configs(): InstanceConfigMap {
       const configs: InstanceConfigMap = {};
-      // Saved instance commands are tenant-editable personal configuration.
-      // Only the operator may replace the bundled executables (also how an
-      // isolated verification fixture supplies its synthetic native engines).
+      // Saved instance commands are tenant-editable; only the operator may replace the bundled executables.
       const cli = (name: "CLAUDE" | "CODEX") => env[`OMB_HOSTED_${name}_CLI`]?.trim() || name.toLowerCase();
       if (catalog.anthropic.length) configs.claude = {
         driver: "claudeAgent", displayName: "Company · Claude",
@@ -115,8 +112,6 @@ export function hostedModelPolicy(dataDirectory: string, env: NodeJS.ProcessEnv 
         } },
       };
     },
-    /** A one-time route migration drops only native continuation handles. The
-     * canonical conversations and branches remain, and rewind replays them. */
     reconcile(store: Store) {
       const marker = join(dataDirectory, "hosted-model-policy.json");
       const identity = JSON.stringify({ version: 1, admin: hosted.admin.origin, workspace: hosted.workspace });
@@ -129,7 +124,7 @@ export function hostedModelPolicy(dataDirectory: string, env: NodeJS.ProcessEnv 
           const next = select(current);
           const changed = JSON.stringify(next) !== JSON.stringify(current);
           if (changed || changedRoute) store.patchTask(bot.id, task.threadId, {
-            modelSelection: next, resumeCursors: {}, lastInstanceId: undefined, rewound: true,
+            ...(task.modelSelection ? { modelSelection: next } : {}), resumeCursors: {}, lastInstanceId: undefined, rewound: true,
             lastContextModel: undefined, appliedCompactionId: undefined,
           });
         }

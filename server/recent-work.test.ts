@@ -1,10 +1,9 @@
-// The recent-work brief: which conversations count as a bot's, how the
-// newest line from each is worded, what a finished turn leaves in the log.
 import { describe, expect, it } from "vitest";
 
 import {
   botThreads,
   parseSince,
+  parseUntil,
   recentWorkLines,
   recentWorkPrompt,
   RECENT_WORK_MAX_CHARS,
@@ -29,13 +28,22 @@ const store: RecentWorkStore = {
 const me = { id: "me", threadId: "main", tasks: [task("t-inv", "Invoice reconciliation"), task("t-inv", "duplicate id")] };
 
 describe("botThreads", () => {
+  it("leaves out an automation run's own conversation: its result already sits in the chat it reported to", () => {
+    const withRun = { ...me, tasks: [...me.tasks, { ...task("run-1", "Inbox brief · Oct 21"), routineRunId: "run-1" }] };
+    expect(botThreads(store, withRun, "Milind").map((thread) => thread.threadId)).not.toContain("run-1");
+  });
+
+  it("on a Team Cloud calls only a chat private to one person private, never the bot's shared main chat", () => {
+    const threads = botThreads(store, me, "Milind", (threadId) => threadId === "t-inv");
+    expect(threads.filter((thread) => thread.private).map((thread) => thread.threadId)).toEqual(["t-inv", "dm-them"]);
+  });
+
   it("lists the main chat, tasks, and the rooms the bot belongs to, each named for the bot", () => {
     expect(botThreads(store, me, "Milind")).toEqual([
       { threadId: "main", where: "1:1 with Milind", title: "Getting started", private: true },
       { threadId: "t-inv", where: "1:1 with Milind", title: "Invoice reconciliation", private: true },
       { threadId: "room-ops", where: 'room "Ops"', title: null, private: false },
       { threadId: "room-ops-t1", where: 'room "Ops"', title: "Deploy day", private: false },
-      // a DM room is private the way a 1:1 is
       { threadId: "dm-them", where: 'room "DM"', title: null, private: true },
     ]);
   });
@@ -69,7 +77,6 @@ describe("recentWorkLines + recentWorkPrompt", () => {
       at: now - index,
       head: "word ".repeat(200),
     })));
-    // one thread → one line, however many messages it has
     expect(lines).toHaveLength(1);
     expect(lines[0]!.said.length).toBeLessThanOrEqual(160);
     expect(lines[0]!.said.endsWith("…")).toBe(true);
@@ -128,5 +135,28 @@ describe("parseSince", () => {
       if (previousTimezone === undefined) delete process.env.TZ;
       else process.env.TZ = previousTimezone;
     }
+  });
+});
+
+describe("parseUntil", () => {
+  // Both ends are built in the process's own zone, so the day boundaries agree wherever the suite runs.
+  const endOf = (year: number, month: number, day: number) => new Date(year, month, day, 23, 59, 59, 999).getTime();
+
+  it("closes a window on the last instant of a named day, so one day is a whole day", () => {
+    const now = new Date(2026, 8, 16, 10, 30).getTime();
+    expect(parseUntil("2026-09-15", now)).toBe(endOf(2026, 8, 15));
+    expect(parseUntil("today", now)).toBe(endOf(2026, 8, 16));
+    expect(parseUntil("Yesterday", now)).toBe(endOf(2026, 8, 15));
+    expect(parseUntil("2026-09-15", now)).toBeGreaterThan(parseSince("2026-09-15", now)!);
+  });
+
+  it("leaves spans, epochs and explicit clock times as the instant they name", () => {
+    const now = new Date(2026, 8, 16, 10, 30).getTime();
+    expect(parseUntil("24h", now)).toBe(parseSince("24h", now));
+    expect(parseUntil(String(now), now)).toBe(now);
+    expect(parseUntil("2026-09-15 09:00", now)).toBe(new Date(2026, 8, 15, 9).getTime());
+    expect(parseUntil("2026-09-01T00:00:00Z", now)).toBe(Date.UTC(2026, 8, 1));
+    expect(parseUntil("soon", now)).toBeNull();
+    expect(parseUntil("", now)).toBeNull();
   });
 });

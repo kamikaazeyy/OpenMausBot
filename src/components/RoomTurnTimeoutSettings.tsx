@@ -25,9 +25,6 @@ export function RoomTurnTimeoutSettings() {
     if (!dirty || saveInFlight.current) return;
     const parsed = parseRoomTurnTimeoutMinutes(value);
     if (!parsed.ok) {
-      // Both rejection branches mean the same thing — out of range — so the
-      // sentence comes from the catalog. The parser stays pure and keeps its
-      // own English copy for its unit test.
       setError(t("settings.roomTurns.range"));
       return;
     }
@@ -57,7 +54,7 @@ export function RoomTurnTimeoutSettings() {
       </label>
       <div
         className={`flex max-w-[220px] items-center rounded-lg border bg-inset ${
-          error ? "border-danger/60" : "border-hairline/40 focus-within:border-hairline"
+          error ? "border-danger/60" : "border-hairline/40 focus-within:border-focus"
         }`}
       >
         <input

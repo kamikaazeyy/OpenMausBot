@@ -5,8 +5,11 @@
 Settings → Backups → **Export full backup** → password and confirmation →
 encrypted `.ombbackup` download. Import uses a native file input, password,
 validated preview and an explicit **REPLACE** confirmation. It is replacement,
-not an additive team import. The desktop must fully quit and reopen; a hosted
-server must restart. No restore writes into a running Store.
+not an additive team import. Click **Restart and restore** on the local desktop
+to quit and reopen it; closing only its window does not restart the server.
+A hosted server must restart before its browser's **Retry** can finish recovery.
+No restore writes into a running Store. The native-button workflow is exercised
+by the [company-backup fixture](company-backups.md).
 
 The previous workspace is retained under `.backups/safety-<restore-id>/data`.
 Keep this copy until the restored workspace is checked. Do not publish it.
@@ -44,6 +47,9 @@ pnpm exec vitest run server/workspace-backup-workflow.test.ts --silent=false
 
 ## Additional checks
 
+Export worker behavior and repeatable latency measurements are documented in
+[Backup responsiveness](backup-responsiveness.md).
+
 ```sh
 pnpm exec vitest run server/workspace-backup.test.ts \
   server/workspace-backup-policy.test.ts \
@@ -75,7 +81,9 @@ saved account credentials/connections, remote VM disks, other workspaces, extern
 project files, external CLI/browser login homes, or live device sessions. The
 10 GB and 100,000-entry limits fail visibly. Scheduled routines/webhooks are paused and
 unfinished work is not replayed after restore. Known temporary sockets, leases,
-tool downloads and caches are excluded; unknown special files are rejected.
+tool downloads and caches are excluded, as are the Organization library's
+downloaded catalog and release files (`org-library/catalog.json`,
+`org-library/blobs/`); unknown special files are rejected.
 If a configured provider login home is inside ordinary workspace files rather
 than the excluded `providers/` directory, export and restore refuse to proceed
 until that login storage is moved outside the backed-up files.

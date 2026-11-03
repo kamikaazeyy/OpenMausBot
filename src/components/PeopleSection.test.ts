@@ -25,6 +25,9 @@ describe("people helpers", () => {
       { entry: "bob@acme.test", role: "member", isDomain: false, lastSeenAt: null, devices: 0, turns: 0, costUsd: null },
       { entry: "@acme.test", role: "member", isDomain: true, lastSeenAt: null, devices: 0, turns: 0, costUsd: null },
     ]);
+    const estimated = mergePeople({ admins: ["ada@example.test"], members: [] }, [], [{ key: "user:ada@example.test", turns: 2, costUsd: 1.5, estimatedUsd: 0.5 }]);
+    expect(estimated[0]).toMatchObject({ costUsd: 1.5, estimated: true });
+    expect(renderToStaticMarkup(createElement(PeopleTable, { people: estimated, busy: false, onRole() {}, onRemove() {}, onLink() {} }))).toContain("~$1.50");
     expect(lastSeenLabel(null)).toBe("Never");
     expect(lastSeenLabel(Date.now() - 60_000)).toBe("Today");
     expect(lastSeenLabel(Date.parse("2026-09-01T12:00:00Z"), Date.parse("2026-09-10T12:00:00Z"))).toBe("2026-09-01");
@@ -46,7 +49,7 @@ describe("people table", () => {
     expect(html).toContain("$3.50");
     expect(html).toContain("Never");
     expect(html).toContain("everyone at acme.test");
-    expect(html).toContain(">Make member<");
+    expect(html).toContain(">Make user<");
     expect(html).toContain(">Make admin<");
     expect(html).toContain(">Remove<");
     expect(html).toContain('aria-label="Invite link"');
@@ -89,14 +92,14 @@ describe("people on a workspace the organisation's Admin manages", () => {
     const people: Person[] = [{ entry: "bob@acme.test", role: "member", isDomain: false, lastSeenAt: null, devices: 1, turns: 3, costUsd: 1.25 }];
     const html = renderToStaticMarkup(createElement(PortalPeople, { peopleUrl: url, people }));
     expect(html).toContain("data-people-portal");
-    expect(html).toContain("People are managed in your organisation&#x27;s Admin");
+    expect(html).toContain("People are managed in your organization&#x27;s Admin");
     expect(html).toContain(`href="${url}"`);
     expect(html).toContain('target="_blank"');
     expect(html).toContain('rel="noopener noreferrer"');
     expect(html).toContain("Manage people in Admin");
     expect(html).toContain("bob@acme.test");
     expect(html).toContain("$1.25");
-    expect(html).not.toMatch(/Make admin|Make member|>Remove<|Invite link|<input|<form|pairing code|ends their account sessions/);
+    expect(html).not.toMatch(/Make admin|Make user|>Remove<|Invite link|<input|<form|pairing code|ends their account sessions/);
     expect(renderToStaticMarkup(createElement(PortalPeople, { peopleUrl: null, people: [] }))).toContain("Nobody has signed in here yet.");
   });
 });

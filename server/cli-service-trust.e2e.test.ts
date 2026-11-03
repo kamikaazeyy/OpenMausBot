@@ -1,10 +1,4 @@
-// `openmausbot serve` on a server that trusts local requests only as a
-// service (OMB_LOOPBACK_TRUST=service). The real CLI starts the real server
-// in a disposable home: the server refuses session-less local admin requests,
-// yet the CLI that started it still prints a pairing code through the secret
-// it handed the server on stdin, and keeps running. Separate CLI commands
-// (and anything else on the machine, a bot's shell included) are refused
-// with an explanation instead of a misleading empty answer.
+// The real CLI starts the real server in a disposable home with OMB_LOOPBACK_TRUST=service.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,13 +8,14 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import { freePortBlock } from "./testing/ports.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ENTRY = join(SERVER_DIR, "openmausbot.ts");
-const PORT = 38800 + Math.floor(Math.random() * 5_000);
 const run = promisify(execFile);
 
 let home: string;
+let PORT: number;
 let serve: ChildProcess;
 let output = "";
 
@@ -42,6 +37,7 @@ const cli = async (args: string[]) => {
 describe.skipIf(process.platform === "win32")("openmausbot serve under service loopback trust", () => {
   beforeAll(async () => {
     home = mkdtempSync(join(tmpdir(), "omb-cli-service-"));
+    PORT = await freePortBlock([0, 1]);
     serve = spawn(process.execPath, ["--experimental-strip-types", ENTRY, "serve", "--port", String(PORT), "--data-dir", join(home, "data")], {
       env: environment(), stdio: ["ignore", "pipe", "pipe"],
     });

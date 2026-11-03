@@ -8,9 +8,17 @@ import {
   journalSummary,
   relativeTime,
   topicFileName,
+  tidySummary,
   type MemoryCapacity,
   type MemoryJournalRow,
 } from "./memory";
+
+it("reports organized notes rather than saying nothing was tidied", () => {
+  const report = { at: 0, expired: 0, duplicates: 0, superseded: 0, deferred: 0, contradictionsChecked: false };
+  expect(tidySummary(report)).toBe("Nothing to tidy");
+  expect(tidySummary({ ...report, organized: 1 })).toBe("Filed 1 note into topics");
+  expect(tidySummary({ ...report, organized: 2 })).toBe("Filed 2 notes into topics");
+});
 
 const index = (overrides: Partial<MemoryCapacity> = {}): MemoryCapacity => ({
   lines: 40,
@@ -45,7 +53,7 @@ describe("capacityStatus", () => {
   it("always says the plain sentence about what loads", () => {
     const status = capacityStatus(index());
     expect(status.level).toBe("ok");
-    expect(status.sentence).toBe("40 of 200 lines · 2 KB of 23.4 KB — only the first 200 lines load each turn.");
+    expect(status.sentence).toBe("40 of 200 lines · 2 KB of 23.4 KB. Only the first 200 lines load each turn.");
     expect(status.warning).toBeNull();
     expect(status.lineShare).toBeCloseTo(0.2);
   });
@@ -60,7 +68,7 @@ describe("capacityStatus", () => {
     const status = capacityStatus(index({ lines: 260, loadedLines: 200, truncated: true }));
     expect(status.level).toBe("over");
     expect(status.warning).toBe(
-      "260 lines saved, 200 load into every conversation — 60 lines are not being loaded. Trim this file or move notes into a topic file.",
+      "260 lines saved, 200 load into every conversation. 60 lines are not being loaded. Trim this file or move notes into a topic file.",
     );
     expect(capacityStatus(index({ lines: 201, loadedLines: 200, truncated: true })).warning).toContain("1 line is not being loaded");
   });
@@ -68,7 +76,7 @@ describe("capacityStatus", () => {
   it("explains a byte cut when the line count fits", () => {
     const status = capacityStatus(index({ lines: 10, bytes: 30_000, loadedBytes: 24_000, truncated: true }));
     expect(status.level).toBe("over");
-    expect(status.warning).toContain("29.3 KB saved, 23.4 KB load into every conversation — the rest is not being loaded");
+    expect(status.warning).toContain("29.3 KB saved, 23.4 KB load into every conversation. The rest is not being loaded");
   });
 
   it("does not divide by a zero budget", () => {
@@ -111,6 +119,7 @@ describe("journalSummary", () => {
       "Scout created the 2026-09-10 log with 1 line",
     );
     expect(journalSummary(row({ actor: "import" }), "Scout")).toBe("An import added 2 lines to MEMORY.md");
+    expect(journalSummary(row({ actor: "upkeep", via: "capture" }), "Scout")).toBe("Memory upkeep added 2 lines to MEMORY.md");
   });
 });
 
@@ -123,6 +132,9 @@ describe("journalSource", () => {
     expect(journalSource(row({ actor: "person", via: "disk" }))).toBe("changed outside the app");
     expect(journalSource(row({ actor: "person", via: "revert" }))).toBe("undo");
     expect(journalSource(row({ actor: "import", via: "import" }))).toBeNull();
+    expect(journalSource(row({ actor: "upkeep", via: "tidy" }))).toBe("tidy-up");
+    expect(journalSource(row({ actor: "upkeep", via: "capture", threadTitle: "Plans" }))).toBe("noticed in chat “Plans”");
+    expect(journalSource(row({ actor: "upkeep", via: "capture" }))).toBe("noticed in a chat");
   });
 });
 

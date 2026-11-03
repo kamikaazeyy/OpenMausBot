@@ -144,36 +144,51 @@ This does not prove resumption or cleanup of real provider sessions after a cras
 
 ## Concurrent-task regression
 
-### Delegation mailbox
+### Hand-offs on the job runtime
 
-Queued handoffs now wait through repeated busy turns rather than giving up
-after three. The delivery window is 24 hours; an hourly sweep expires a
-handoff that is still unable to run, reports the failure, and wakes its sender.
-A free target can accept an overdue handoff. At restart, already elapsed
-windows receive a fresh 24 hours **before** dispatching any recovered jobs;
-otherwise the first job can occupy the target and expire the rest of its
-backlog. Valid, unexpired windows retain their saved deadlines. This is a
-wall-clock window, not precise uptime accounting: sleep within a running
-process counts. A routine waiting on a peer skips overlapping interval fires
-until the handoff settles (potentially about 25 hours); it never duplicates
-the pending job to catch up.
+Every hand-off between bots is an assignment on the job runtime
+(docs/runtime-contract.md §9): `coordinate_bots` from a chat, a room, a
+routine run, a webhook run, a goal run, a Cloud guest's turn or a standing
+external runtime. There is no mailbox: a queued assignment is bounded by
+the runtime's queue clock (§6, 24 hours, `failed(expired)` and reported), its
+windows restart at boot, and nothing outside `server/runtime/` holds hand-off
+state. The ledger the mailbox kept (`delegations.json`,
+`delegation-receipts.json`) is imported once at boot and renamed `*.migrated`
+(`server/runtime/import-legacy.ts`). A routine run waiting on teammates is
+`waiting` while the runtime has outstanding assignments for its thread; the
+run's resume is a routine turn; a restart reruns a cut teammate turn once (§5)
+and keeps the run waiting instead of failing it. `assignment_status` reads an
+assignment's status, outcome and result, or everything a conversation still
+waits on; it is read-only and refuses an id handed out in the same turn.
 
 ```sh
-pnpm exec vitest run server/delegations.test.ts server/peer-roster.test.ts server/drivers/agents-proxy.test.ts
-pnpm exec vitest run server/independent-threads-api.test.ts -t "queues coordinated work behind a peer's approval"
-pnpm exec vitest run server/comms.test.ts
+pnpm exec vitest run server/runtime-paths.e2e.test.ts server/runtime-coordinator.test.ts server/runtime/import-legacy.test.ts
+pnpm exec vitest run server/independent-threads-api.test.ts -t "holds coordinated work behind a peer's approval"
+pnpm exec vitest run server/independent-threads-api.test.ts -t "unanswered|what became of each teammate approval"
+pnpm exec vitest run server/comms.test.ts server/thread-capacity-api.test.ts -t "free slot"
 ```
 
-The mailbox API fixture uses the isolated launcher and per-model fake-engine
-gates. A peer waits on a real approval-broker card. That card keeps fresh
-coordinated work queued even when the peer still has a free thread slot. A
-spare slot admits work only beside a sibling that is actually running.
-Approving the card releases the queued work, and one attributed result
-returns to the Chief without another user prompt. Exact
-control commands, waits, transcripts and the server log path are retained in
-the fixture's `.log.json` evidence, without capability tokens. Queue-unit
-tests cover expiry, multi-job restart recovery, repeated busy periods and
-persisted deadlines. These tests do not claim real-provider performance.
+The approval fixtures use the isolated launcher and per-model fake-engine
+gates. A peer waits on a real approval-broker card. A card holds only its own
+thread: fresh coordinated work waits only while the card's thread holds the
+peer's last free slot, and then the Chief's conversation says once, in a
+notice that never reads as running, whose card it waits behind and where, as
+does the Chief's prompt. With a slot free, the work starts beside the open
+card. Approving the card lets its own turn go on, and one attributed result
+returns to the Chief without another user prompt. The approval cases follow a
+teammate's cards through the broker's own course: the Chief's chip says
+denied, or that nobody answered and the step did not run, never "got your
+approval". The fixture fires the broker's fifteen-minute deadline through a
+marker file (`server/testing/approval-clock-hooks.mjs`, loaded only when
+`OMB_TEST_APPROVAL_CLOCK=1` reaches the isolated launcher). The result a
+Chief's coordination, a routine run's hand-off and a room's coordinator each
+read then leads with the action that did not run; a failed teammate turn
+carries it after its failure, and an action the model asked again and was
+allowed is not named. Exact control commands, waits, transcripts and the
+server log path are retained in the fixture's `.log.json` evidence, without
+capability tokens. The runtime's own suite (`server/runtime/*.test.ts`) covers
+the queue clock, restart reconciliation and the invariants. These tests do not
+claim real-provider performance.
 
 ### Independent tasks
 
@@ -232,3 +247,29 @@ executable while its process is still running. Local mocked Windows tests
 do not substitute for that native check.
 Processes that intentionally detach into a different group are not owned by
 this POSIX group-based cancellation.
+
+## The person's message during a long tool call
+
+```sh
+pnpm exec vitest run server/person-first.e2e.test.ts server/host/person-first.test.ts
+```
+
+A message from the person in their own chat never waits behind a long tool
+call. The e2e test launches the isolated fixture as the desktop app runs it
+(the owner capability makes the send the person's own), scripts one Bash call
+that holds like a CI poll, and sends a second message, which is steered into
+the turn and stays unread. `OMB_PERSON_FIRST_MS=1500` stands in for the minute a
+tool call may hold it. The turn must be stopped with the row "Stopped a step
+that had run for N s, to answer you first", the person's message must stay one
+row, and the next turn must lead with their words and the note naming the
+stopped step, so the bot's reply answers them. A message from a room, a
+routine, a teammate or an app never stops a turn this way, and neither does
+one sent while the turn waits on the person or a computer
+(`server/host/person-first.test.ts`).
+
+### Last exercised
+
+2026-10-30, macOS, isolated fixture from the e2e test: the scripted CI poll
+was stopped 1.5 s after the steered question, and the fake engine answered the
+question in the next turn. With the steered message's watch removed, the
+question stayed unanswered for 30 s and the test failed.

@@ -37,6 +37,8 @@ const safeError = (error, signal) => {
   return new CompanyBackupError("transfer_failed", "The backup transfer could not be completed. Please try again.");
 };
 async function discard(response) { try { await response?.body?.cancel(); } catch {} }
+// Node opens a read stream lazily; an open that fails after the temp dir is removed must not be uncaught, since the request outcome decides.
+const bodyStream = (file, range) => createReadStream(file, { ...range, highWaterMark: 256 * 1024 }).on("error", () => {});
 
 function signedUrl(value, allowLoopbackForTests) {
   let url;
@@ -77,9 +79,9 @@ export function createCompanyBackups({ localRequest, portalRequest, tempRoot, fe
     const response = await localRequest(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal, redirect: "error" });
     if (!response.ok) {
       await discard(response);
-      if (response.status === 401 || response.status === 403) fail("access_changed", "Local workspace access changed. Reopen Backups and try again.");
+      if (response.status === 401 || response.status === 403) fail("access_changed", "Access to this installation changed. Reopen Backups and try again.");
       if (preview && response.status === 400) fail("invalid_archive", "The backup password is incorrect, or the archive is damaged or unsupported. Nothing was restored.");
-      if ([409, 503].includes(response.status)) fail("workspace_busy", "Wait for the local workspace to finish its current work before backing up or restoring.");
+      if ([409, 503].includes(response.status)) fail("workspace_busy", "Wait for this installation to finish its current work before backing up or restoring.");
       fail("local_backup_failed", "The local backup operation could not be completed. Check Backups in the desktop app and try again.");
     }
     if (!response.body) fail("invalid_response", "The local backup service returned an empty response.");
@@ -113,7 +115,7 @@ export function createCompanyBackups({ localRequest, portalRequest, tempRoot, fe
       }
     }, createWriteStream(file, { flags: "wx", mode: 0o600 }), { signal });
     if (bytes !== expectedBytes) fail("invalid_archive", "The archive download was incomplete.");
-    if (!prefix.subarray(0, MAGIC.length).equals(MAGIC)) fail("invalid_archive", "This is not a supported encrypted workspace backup.");
+    if (!prefix.subarray(0, MAGIC.length).equals(MAGIC)) fail("invalid_archive", "This is not a supported encrypted installation backup.");
     return hash.digest("hex");
   }
   async function storageRequest(url, init) {
@@ -129,7 +131,7 @@ export function createCompanyBackups({ localRequest, portalRequest, tempRoot, fe
     const report = (phase, bytesTransferred = 0, totalBytes = 0) => {
       if (phase === lastPhase && bytesTransferred !== totalBytes && Date.now() - lastAt < 250) return;
       lastPhase = phase; lastAt = Date.now();
-      try { onProgress?.({ phase, bytesTransferred, totalBytes }); } catch { /* A view closing must not interrupt cleanup. */ }
+      try { onProgress?.({ phase, bytesTransferred, totalBytes }); } catch {}
     };
     try {
       operationSignal.throwIfAborted();
@@ -170,7 +172,7 @@ export function createCompanyBackups({ localRequest, portalRequest, tempRoot, fe
           const started = await portalRequest(CLOUD, { method: "POST", body: { sizeBytes: exported.bytes, sha256, appVersion, unlockKey: password }, signal: operationSignal });
           if (identifier(started?.id)) pendingId = started.id;
           const backup = cloudMetadata(started, "uploading");
-          if (backup.passwordRequired) fail("update_required", "Update your organisation's Admin service to enable passwordless backups.");
+          if (backup.passwordRequired) fail("update_required", "Update your organization's Admin service to enable passwordless backups.");
           if (backup.sizeBytes !== exported.bytes || backup.sha256 !== sha256 || started.partSizeBytes !== PART_BYTES || started.partCount !== Math.ceil(exported.bytes / PART_BYTES)) fail("invalid_response", "The backup service returned an invalid multipart plan.");
           const parts = [];
           report("uploading", 0, exported.bytes);
@@ -182,7 +184,7 @@ export function createCompanyBackups({ localRequest, portalRequest, tempRoot, fe
                 Object.keys(signed.headers).some(name => name.toLowerCase() !== "content-length") ||
                 new Headers(signed.headers).get("content-length") !== String(sizeBytes)) fail("invalid_response", "The backup service returned invalid upload instructions.");
             liveExpiry(signed.expiresAt);
-            const url = signedUrl(signed.url, allowLoopbackForTests), stream = createReadStream(file, { start, end: start + sizeBytes - 1, highWaterMark: 256 * 1024 });
+            const url = signedUrl(signed.url, allowLoopbackForTests), stream = bodyStream(file, { start, end: start + sizeBytes - 1 });
             let uploaded;
             try { uploaded = await storageRequest(url, { method: "PUT", headers: { "content-length": String(sizeBytes) }, body: stream, duplex: "half", signal: operationSignal }); }
             finally { stream.destroy(); }
@@ -198,7 +200,7 @@ export function createCompanyBackups({ localRequest, portalRequest, tempRoot, fe
           pendingId = null; report("ready", exported.bytes, exported.bytes); return result;
         } finally {
           if (pendingId) {
-            try { await portalRequest(`${CLOUD}/${pendingId}/abort`, { method: "POST", body: {}, signal: AbortSignal.timeout(10_000) }); } catch { /* Server expiry and durable cleanup remain the backstop. */ }
+            try { await portalRequest(`${CLOUD}/${pendingId}/abort`, { method: "POST", body: {}, signal: AbortSignal.timeout(10_000) }); } catch {}
           }
         }
       });
@@ -214,8 +216,7 @@ export function createCompanyBackups({ localRequest, portalRequest, tempRoot, fe
         if (backup.id !== input.id) fail("invalid_response", "The backup service returned a different archive.");
         liveExpiry(signed.expiresAt);
         const url = signedUrl(signed.url, allowLoopbackForTests);
-        // Version 1 is uncompressed tar: encrypted transfer, local upload,
-        // decrypted tar and extracted staging can coexist during preview.
+        // Version 1 is uncompressed tar: transfer, upload, decrypted tar and staging can coexist during preview.
         await checkSpace(directory, backup.sizeBytes * 4);
         report("downloading", 0, backup.sizeBytes);
         const downloaded = await storageRequest(url, { method: "GET", signal: operationSignal });
@@ -225,19 +226,17 @@ export function createCompanyBackups({ localRequest, portalRequest, tempRoot, fe
         if (sha256 !== backup.sha256) fail("checksum_mismatch", "The downloaded backup checksum did not match. Nothing was uploaded locally or restored.");
         await checkSpace(directory, backup.sizeBytes * 3); operationSignal.throwIfAborted();
         report("preparing", 0, backup.sizeBytes);
-        const stream = createReadStream(file, { highWaterMark: 256 * 1024 });
+        const stream = bodyStream(file);
         let response;
         try { response = await localRequest(`${LOCAL}/upload`, { method: "POST", headers: { "content-type": "application/octet-stream", "content-length": String(backup.sizeBytes) }, body: stream, duplex: "half", signal: operationSignal, redirect: "error" }); }
         finally { stream.destroy(); }
-        if (!response.ok) { await discard(response); fail("local_backup_failed", "The verified archive could not be staged in the local workspace."); }
-        // The upload receipt is tiny; use the same bounded JSON reader without
-        // making another request or retaining an unbounded response body.
+        if (!response.ok) { await discard(response); fail("local_backup_failed", "The verified archive could not be staged in this installation."); }
         const receipt = await readUploadReceipt(response, operationSignal);
-        if (!identifier(receipt.id)) fail("invalid_response", "The local workspace returned an invalid upload receipt.");
+        if (!identifier(receipt.id)) fail("invalid_response", "This installation returned an invalid upload receipt.");
         await checkSpace(directory, backup.sizeBytes * 2); operationSignal.throwIfAborted();
         const preview = await localJson(`${LOCAL}/preview`, { id: receipt.id, password }, operationSignal, true);
         if (!identifier(preview.id) || !record(preview.summary) || preview.summary.format !== "openmaus.workspace-backup" || preview.summary.version !== 1 ||
-            !identifier(preview.summary.id) || !Number.isSafeInteger(preview.summary.bytes) || preview.summary.bytes < 0 || preview.summary.bytes > MAX_BYTES) fail("invalid_response", "The local workspace returned an invalid restore preview.");
+            !identifier(preview.summary.id) || !Number.isSafeInteger(preview.summary.bytes) || preview.summary.bytes < 0 || preview.summary.bytes > MAX_BYTES) fail("invalid_response", "This installation returned an invalid restore preview.");
         report("ready", backup.sizeBytes, backup.sizeBytes);
         return { id: preview.id, summary: preview.summary };
       });
@@ -246,7 +245,7 @@ export function createCompanyBackups({ localRequest, portalRequest, tempRoot, fe
 }
 
 async function readUploadReceipt(response, signal) {
-  if (!response.body) fail("invalid_response", "The local workspace returned an empty upload receipt.");
+  if (!response.body) fail("invalid_response", "This installation returned an empty upload receipt.");
   const chunks = []; let bytes = 0;
   for await (const chunk of Readable.fromWeb(response.body)) {
     signal.throwIfAborted(); bytes += chunk.length;
@@ -254,5 +253,5 @@ async function readUploadReceipt(response, signal) {
     chunks.push(chunk);
   }
   try { const value = JSON.parse(Buffer.concat(chunks).toString("utf8")); if (record(value)) return value; } catch {}
-  fail("invalid_response", "The local workspace returned an invalid upload receipt.");
+  fail("invalid_response", "This installation returned an invalid upload receipt.");
 }

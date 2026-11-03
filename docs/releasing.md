@@ -22,6 +22,19 @@ published release** workflow
 verifies and publishes its legacy mirror automatically. Never publish only the
 legacy draft.
 
+The release commit must have passed CI on every platform: the **CI passed on
+the release commit** job waits (while the platforms build) for a ci.yml run
+whose `CI` check passed with every Linux, Windows and macOS shard, on the
+pinned commit or a commit with the same tree, and stops the release before any
+draft if the commit's CI failed. A push to main runs the Linux shards only, so
+unless the release branch's own CI (started by **Prepare next release**) or a
+nightly run covered the same tree, the job runs the full CI on the commit
+itself on a temporary `release-ci/v<version>` branch, which takes about as
+long as the platform builds. After a flaky failure, re-run the failed CI jobs;
+a release still waiting picks up the new attempt, and a release that already
+stopped needs only `gh run rerun <id> --failed`. `ship_without_ci` skips the
+wait, for emergencies only. See [CI job selection](ci.md#main-and-releases).
+
 The workflow refuses to overwrite an already-published version. Manual Release
 runs still require `package.json`'s version to be bumped on the selected ref.
 A release is rejected if any installer, stable download

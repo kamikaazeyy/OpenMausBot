@@ -1,16 +1,13 @@
-// Turning banked token/cost figures into something a header chip can show.
-// Pure, so the numbers can be tested without the components.
 import type { Bot, TaskUsage } from "@/state/store";
 import { t } from "./i18n";
 
 export const EMPTY_USAGE: TaskUsage = { input: 0, output: 0, costUsd: null, turns: 0 };
+type TokenUsage = Pick<TaskUsage, "input" | "output"> & Partial<TaskUsage>;
 
-/** True when a stored cost is a real number (not null, NaN, or Infinity). */
 export function hasFiniteCost(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-/** Sum a set of usages; cost stays null until any of them has one. */
 export function sumUsage(items: Array<TaskUsage | undefined>): TaskUsage {
   const out: TaskUsage = { ...EMPTY_USAGE };
   for (const u of items) {
@@ -21,6 +18,7 @@ export function sumUsage(items: Array<TaskUsage | undefined>): TaskUsage {
     if (hasFiniteCost(u.cachedInput)) out.cachedInput = (out.cachedInput ?? 0) + u.cachedInput;
     if (hasFiniteCost(u.costUsd)) out.costUsd = (out.costUsd ?? 0) + u.costUsd;
   }
+  if (items.some((u) => u && u.input > 0 && !cachedKnown(u))) delete out.cachedInput;
   return out;
 }
 
@@ -28,7 +26,6 @@ export function botUsage(bot: Pick<Bot, "tasks">): TaskUsage {
   return sumUsage((bot.tasks ?? []).map((t) => t.usage));
 }
 
-/** 950 → "950", 12_400 → "12.4k", 2_300_000 → "2.3M" */
 export function formatTokens(n: number): string {
   if (!hasFiniteCost(n)) return "0";
   if (n < 1000) return String(n);
@@ -37,7 +34,6 @@ export function formatTokens(n: number): string {
 }
 const trim = (x: number) => (x >= 100 ? Math.round(x).toString() : x.toFixed(1).replace(/\.0$/, ""));
 
-/** Task-picker variant: hide unused tasks and spell out small counts. */
 export function formatTaskTokens(total: number): string | null {
   if (!Number.isFinite(total) || total < 1) return null;
   const n = Math.trunc(total);
@@ -52,7 +48,6 @@ const formatTenths = (value: number) => {
   return fraction === 0 ? `${value / 10}` : `${(value - fraction) / 10}.${fraction}`;
 };
 
-/** Dollars, with enough precision that a cheap turn isn't "$0.00". */
 export function formatUsd(usd: number): string {
   if (!hasFiniteCost(usd)) return "";
   if (usd === 0) return "$0";
@@ -60,47 +55,49 @@ export function formatUsd(usd: number): string {
   return `$${usd.toFixed(2)}`;
 }
 
-/** How much of `input` the provider served from its prompt cache. Clamped to
- * `input` so a provider that reports cache reads outside its input figure
- * can never produce a negative "fresh" number. */
-export function cachedInput(u: TaskUsage): number {
+/** Clamped to `input`: some providers report cache reads outside their input figure. */
+export function cachedInput(u: TokenUsage): number {
   return hasFiniteCost(u.cachedInput) ? Math.min(Math.max(0, u.cachedInput), u.input) : 0;
 }
 
-/** The in/out breakdown behind the headline figure, with the cached share
- * called out when there is one: "88.2k in (79k cached) · 1.2k out". The
- * headline counts every token the model processed — five short messages
- * on a thread with a system prompt and tool schemas really do cost the
- * model ~17k tokens of reading each turn — so the breakdown is where the
- * "was that really 100k?" question gets answered. */
-export function usageDetail(u: TaskUsage): string {
-  const cached = cachedInput(u);
-  const input =
-    cached > 0
-      ? t("chat.usage.inCached", { tokens: formatTokens(u.input), cached: formatTokens(cached) })
-      : t("chat.usage.in", { tokens: formatTokens(u.input) });
-  return `${input} · ${t("chat.usage.out", { tokens: formatTokens(u.output) })}`;
+export function usageDetail(u: TokenUsage): string {
+  const input = cachedKnown(u)
+    ? `${t("chat.usage.uncachedInput", { tokens: formatTokens(uncachedInput(u)) })} · ${t("chat.usage.cachedInput", { tokens: formatTokens(cachedInput(u)) })}`
+    : t("chat.usage.totalInput", { tokens: formatTokens(u.input) });
+  return `${input} · ${t("chat.usage.output", { tokens: formatTokens(u.output) })}`;
 }
 
-/** Tokens the model had not seen before, plus what it wrote: `input` minus
- * the cached share, plus `output`. The figure a person means by "how much
- * did this cost me", and the one every other usage tool headlines — the raw
- * total counts the thread being re-read on every call and grows by the whole
- * conversation per message, which reads as a bug (issue #527). */
+export function uncachedInput(u: TokenUsage): number {
+  return Math.max(0, u.input - cachedInput(u));
+}
+
 export function freshTokens(u: TaskUsage): number {
-  return Math.max(0, u.input - cachedInput(u)) + u.output;
+  return uncachedInput(u) + u.output;
 }
 
-/** Whether the engine ever told us the cached share. Without it the raw
- * total is the only honest headline. */
-export function cachedKnown(u: TaskUsage): boolean {
+export function headlineTokens(u: TaskUsage): number {
+  return cachedKnown(u) ? freshTokens(u) : u.input + u.output;
+}
+
+export function cachedKnown(u: Pick<TaskUsage, "cachedInput">): boolean {
   return hasFiniteCost(u.cachedInput);
+}
+
+export function tokensColumnLabel(total: TaskUsage): string {
+  return t(cachedKnown(total) ? "usage.colNewTokens" : "usage.colTokens");
+}
+
+export function cachedUsageNote(total: TaskUsage): string | null {
+  const cached = cachedInput(total);
+  if (cached <= 0) return null;
+  return t("usage.cachedNote", {
+    cached: formatTokens(cached),
+    total: formatTokens(total.input + total.output),
+  });
 }
 
 export type ContextTone = "quiet" | "warning" | "danger";
 
-/** The last model call's prompt against the model's window, with the same
- * thresholds ccusage's statusline uses: green under 50%, red over 80%. */
 export function contextShare(u: TaskUsage): { tokens: number; window?: number; percent?: number; tone: ContextTone } | null {
   const ctx = u.context;
   if (!ctx || !hasFiniteCost(ctx.tokens) || ctx.tokens <= 0) return null;
@@ -110,14 +107,12 @@ export function contextShare(u: TaskUsage): { tokens: number; window?: number; p
   return { tokens: ctx.tokens, window, percent, tone };
 }
 
-/** "ctx 142k" or "ctx 52%": the compact form beside the headline. */
 export function contextChip(u: TaskUsage): string {
   const share = contextShare(u);
   if (!share) return "";
   return t("chat.usage.contextShort", { value: share.percent === undefined ? formatTokens(share.tokens) : `${share.percent}%` });
 }
 
-/** "Context 142k (52% of 272k)" or "Context 142k". */
 export function contextDetail(u: TaskUsage): string | null {
   const share = contextShare(u);
   if (!share) return null;
@@ -126,25 +121,19 @@ export function contextDetail(u: TaskUsage): string | null {
     : t("chat.usage.context", { tokens: formatTokens(share.tokens) });
 }
 
-/** "Last message: 210k read · 1.2k new". */
 export function lastTurnDetail(u: TaskUsage): string | null {
   const last = u.lastTurn;
   if (!last || !hasFiniteCost(last.input)) return null;
-  const cached = hasFiniteCost(last.cachedInput) ? Math.min(Math.max(0, last.cachedInput), last.input) : 0;
-  return t("chat.usage.lastTurn", { read: formatTokens(last.input + last.output), fresh: formatTokens(Math.max(0, last.input - cached) + last.output) });
+  return t("chat.usage.lastTurnSplit", { detail: usageDetail(last) });
 }
 
-/** The chip text: cost when the engine reports one, else new tokens when the
- * engine reports its cached share, else every token as before. Empty string
- * when nothing has been spent — a fresh task shows no chip. */
 export function usageChip(u: TaskUsage): string {
   if (u.turns === 0 && u.input + u.output === 0) return "";
   if (hasFiniteCost(u.costUsd)) return formatUsd(u.costUsd);
-  if (cachedKnown(u)) return t("chat.usage.new", { tokens: formatTokens(freshTokens(u)) });
-  return t("chat.usage.tokens", { tokens: formatTokens(u.input + u.output) });
+  if (cachedKnown(u)) return t("chat.usage.uncachedShort", { tokens: formatTokens(uncachedInput(u)) });
+  return t("chat.usage.inputShort", { tokens: formatTokens(u.input) });
 }
 
-/** How to caption a cost figure given how the engine is billed. */
 export function costCaption(billing: "metered" | "subscription" | undefined): string {
   if (billing === "subscription") return t("chat.usage.captionSubscription");
   if (billing === "metered") return t("chat.usage.captionMetered");

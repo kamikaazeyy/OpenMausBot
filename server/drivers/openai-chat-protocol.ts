@@ -1,11 +1,12 @@
-// Structured chat-completions calls. Assistant content is never parsed as a tool.
+// Structured chat-completions calls. Assistant content becomes a tool call only for a local model, in chat-text-tool-calls.ts.
 export interface ChatToolCall {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
 }
 
-export const MAX_CHAT_TOOL_CALLS = 32;
+/** Calls one model reply may carry (its index bound). */
+const MAX_REPLY_TOOL_CALLS = 32;
 const MAX_ARGUMENT_CHARS = 256_000;
 
 export class ChatProtocolError extends Error {}
@@ -40,15 +41,16 @@ export class ChatToolCalls {
   add(value: unknown, streaming: boolean): void {
     if (value === undefined || value === null) return;
     if (!Array.isArray(value)) throw new ChatProtocolError("provider returned invalid tool_calls");
+    const omitted = (field: unknown) => field === undefined || (streaming && field === null);
     for (const [position, raw] of value.entries()) {
       const delta = object(raw);
-      const index = streaming ? delta?.index : position;
-      if (!delta || !Number.isInteger(index) || Number(index) < 0 || Number(index) >= MAX_CHAT_TOOL_CALLS) {
+      const index = !streaming ? position : delta?.index ?? this.slotOf(delta?.id);
+      if (!delta || !Number.isInteger(index) || Number(index) < 0 || Number(index) >= MAX_REPLY_TOOL_CALLS) {
         throw new ChatProtocolError("provider returned an invalid tool-call index");
       }
       const call = this.calls.get(Number(index)) ?? { id: "", type: "function", function: { name: "", arguments: "" } };
-      if (delta.type !== undefined && delta.type !== "function") throw new ChatProtocolError("unsupported tool-call type");
-      if (delta.id !== undefined) {
+      if (!omitted(delta.type) && delta.type !== "function") throw new ChatProtocolError("unsupported tool-call type");
+      if (!omitted(delta.id)) {
         if (typeof delta.id !== "string" || !delta.id || delta.id.length > 256 || (call.id && call.id !== delta.id)) {
           throw new ChatProtocolError("provider changed or omitted a tool-call ID");
         }
@@ -58,7 +60,7 @@ export class ChatToolCalls {
         const fn = object(delta.function);
         if (!fn) throw new ChatProtocolError("provider returned an invalid tool-call function");
         for (const field of ["name", "arguments"] as const) {
-          if (fn[field] === undefined) continue;
+          if (omitted(fn[field])) continue;
           if (typeof fn[field] !== "string") throw new ChatProtocolError("provider returned invalid tool-call arguments or name");
           call.function[field] += fn[field];
           if (field === "arguments") this.argumentChars += fn[field].length;
@@ -69,6 +71,14 @@ export class ChatToolCalls {
       }
       this.calls.set(Number(index), call);
     }
+  }
+
+  /** Gemini's OpenAI-compatible endpoint streams each call whole, with an id and no index: the slot of the call with
+   * that id, else the one after the last. */
+  private slotOf(id: unknown): number | undefined {
+    if (typeof id !== "string" || !id) return undefined;
+    for (const [slot, call] of this.calls) if (call.id === id) return slot;
+    return this.calls.size ? Math.max(...this.calls.keys()) + 1 : 0;
   }
 
   finish(reason: string | null, malformedFrame: boolean): ChatToolCall[] {
