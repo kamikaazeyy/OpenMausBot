@@ -19374,7 +19374,7 @@ for (const row of chatFollowups()) {
 restoreSteeredMessages();
 restoreChannelMessages();
 
-server.listen(PORT, "127.0.0.1", () => {
+server.listen(PORT, "0.0.0.0", () => {
   companyRuntimeReady();
   console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
   followupsReady = true;
