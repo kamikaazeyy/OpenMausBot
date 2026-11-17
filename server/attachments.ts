@@ -5,16 +5,18 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { link, open, unlink } from "node:fs/promises";
-import { join, extname } from "node:path";
-import { FILE_MAX_BYTES } from "../shared/upload-limits.ts";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import { FILE_MAX_BYTES, PREVIEW_MAX_BYTES } from "../shared/upload-limits.ts";
 import { DATA_DIR } from "./config.ts";
+import { boxUploadsDir } from "./bot-box/plan.ts";
 
-export { FILE_MAX_BYTES } from "../shared/upload-limits.ts";
+export { FILE_MAX_BYTES, PREVIEW_MAX_BYTES } from "../shared/upload-limits.ts";
 export const ATTACHMENTS_DIR = join(DATA_DIR, "attachments");
 
 export const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
@@ -67,7 +69,7 @@ const IMAGE_MIMES: Record<string, string> = {
   "image/webp": ".webp",
 };
 
-/** No archives, binaries, HTML, SVG or scripts. The claimed mime picks the extension; an attacker's filename never does. */
+/** Types kept under their own extension; archives are kept as sent, never unpacked. The claimed mime picks the stored extension; an attacker's filename never does. */
 const FILE_MIMES: Readonly<Record<string, string>> = {
   "video/mp4": ".mp4",
   "video/webm": ".webm",
@@ -101,7 +103,22 @@ const FILE_MIMES: Readonly<Record<string, string>> = {
   "application/vnd.oasis.opendocument.text": ".odt",
   "application/vnd.oasis.opendocument.spreadsheet": ".ods",
   "application/vnd.oasis.opendocument.presentation": ".odp",
+  "application/zip": ".zip",
+  "application/x-zip-compressed": ".zip",
+  "application/vnd.rar": ".rar",
+  "application/x-rar-compressed": ".rar",
+  "application/x-7z-compressed": ".7z",
+  "application/x-tar": ".tar",
+  "application/gzip": ".gz",
+  "application/x-gzip": ".gz",
+  "application/x-compressed-tar": ".tgz",
+  "application/x-bzip2": ".bz2",
+  "application/x-xz": ".xz",
 };
+
+/** Every other type (binaries, HTML, SVG, scripts) is stored as an inert `.bin` download, never rendered. */
+const GENERIC_FILE_MIME = "application/octet-stream";
+const GENERIC_FILE_EXTENSION = ".bin";
 
 export function extensionForMime(mime: string | undefined): string | null {
   if (!mime) return null;
@@ -169,6 +186,21 @@ export function cleanupStaleAttachmentPartials(now = Date.now()): number {
   return removed;
 }
 
+/** A removed upload also goes from every conversation's box uploads folder, where box-attachments.ts linked it, so no box
+ * can still read it and its space comes back. */
+function dropBoxUploadCopies(names: readonly string[], dataDir = DATA_DIR): void {
+  if (!names.length) return;
+  const root = join(dataDir, "box-uploads");
+  const dirs = (path: string) => { try { return readdirSync(path); } catch { return []; } };
+  for (const bot of dirs(root)) {
+    for (const thread of dirs(join(root, bot))) {
+      for (const name of names) {
+        try { rmSync(join(boxUploadsDir(dataDir, bot, thread), name), { force: true }); } catch { /* best effort: a file still in use stays */ }
+      }
+    }
+  }
+}
+
 /** Every removal of a file saveImage/saveFile created must come through here, or the cache overcounts and rejects uploads. */
 export function deleteAttachment(path: string): void {
   try {
@@ -177,8 +209,11 @@ export function deleteAttachment(path: string): void {
     if (committedAttachmentBytes !== null) {
       committedAttachmentBytes = Math.max(0, committedAttachmentBytes - size);
     }
-  } catch {
+  } catch (error) {
+    // An upload still on disk (a busy file on Windows) keeps its box copies; one already gone loses them.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
   }
+  if (resolve(dirname(path)) === resolve(ATTACHMENTS_DIR)) dropBoxUploadCopies([basename(path)]);
 }
 
 /** Settings → General: what the store holds against its ceiling, rescanned so files removed outside the app count. */
@@ -215,6 +250,7 @@ export function clearAttachments(kept: ReadonlySet<string>, now = Date.now()): {
   let removed = 0;
   let freedBytes = 0;
   let failed = 0;
+  const gone: string[] = [];
   for (const entry of readdirSync(ATTACHMENTS_DIR, { withFileTypes: true })) {
     if (!entry.isFile() || PARTIAL_NAME.test(entry.name) || kept.has(entry.name)) continue;
     const path = join(ATTACHMENTS_DIR, entry.name);
@@ -222,6 +258,7 @@ export function clearAttachments(kept: ReadonlySet<string>, now = Date.now()): {
       const { mtimeMs, size } = statSync(path);
       if (now - mtimeMs < ATTACHMENT_CLEAR_MIN_AGE_MS) continue;
       unlinkSync(path);
+      gone.push(entry.name);
       removed += 1;
       freedBytes += size;
     } catch (error) {
@@ -229,6 +266,7 @@ export function clearAttachments(kept: ReadonlySet<string>, now = Date.now()): {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") failed += 1;
     }
   }
+  dropBoxUploadCopies(gone);
   invalidateAttachmentAccounting();
   return { removed, freedBytes, failed };
 }
@@ -321,7 +359,7 @@ async function withUploadLock<T>(uploadId: string | undefined, operation: () => 
 
 /** saveFile/saveImage only ever write `${uuid}${extension}` with one of these extensions. */
 const KNOWN_ATTACHMENT_EXTENSIONS = Array.from(
-  new Set([...Object.values(IMAGE_MIMES), ...Object.values(FILE_MIMES)]),
+  new Set([...Object.values(IMAGE_MIMES), ...Object.values(FILE_MIMES), GENERIC_FILE_EXTENSION]),
 );
 
 function statSizeIfFile(path: string): number | null {
@@ -376,11 +414,9 @@ export function extensionForFileMime(mime: string | undefined): string | null {
   return value ? FILE_MIMES[value] ?? null : null;
 }
 
-/** Separators and encoded separators are rejected, not massaged, so traversal attempts stay visible as bad requests. */
+/** Separators and encoded separators are rejected, not massaged, so traversal attempts stay visible as bad requests.
+ * A known type takes its extension from the mime; any other keeps its own short one, in the display name only. */
 export function sanitizeSharedFileName(name: string, mime: string): string {
-  const extension = extensionForFileMime(mime);
-  if (!extension) throw statusError(400, "content-type must be a supported document or audio type");
-
   const normalized = name.normalize("NFKC").trim();
   if (!normalized) throw statusError(400, "name is required");
   if (normalized.length > 512) throw statusError(400, "name is too long");
@@ -389,7 +425,9 @@ export function sanitizeSharedFileName(name: string, mime: string): string {
   }
 
   const dot = normalized.lastIndexOf(".");
-  const withoutExtension = dot > 0 ? normalized.slice(0, dot) : normalized;
+  const own = dot > 0 ? normalized.slice(dot).toLowerCase() : "";
+  const extension = extensionForFileMime(mime) ?? (/^\.[a-z0-9]{1,10}$/.test(own) ? own : "");
+  const withoutExtension = dot > 0 && extension ? normalized.slice(0, dot) : normalized;
   const safeCharacters = Array.from(withoutExtension, (character) => {
     const code = character.charCodeAt(0);
     return code <= 31 || code === 127 || "<>:\"|?*".includes(character) ? "_" : character;
@@ -411,12 +449,10 @@ export async function saveFile(
   mime: string,
   options: { uploadId?: string; expectedBytes?: number } = {},
 ): Promise<SavedFile> {
-  const normalized = normalizedMime(mime);
-  if (!normalized || !extensionForFileMime(normalized)) {
-    throw statusError(400, "content-type must be a supported document or audio type");
-  }
+  const known = extensionForFileMime(mime);
+  const normalized = known ? normalizedMime(mime)! : GENERIC_FILE_MIME;
+  const extension = known ?? GENERIC_FILE_EXTENSION;
   const name = sanitizeSharedFileName(originalName, normalized);
-  const extension = extensionForFileMime(normalized)!;
   const uploadId = validateAttachmentUploadId(options.uploadId);
   const expectedBytes = options.expectedBytes;
   if (expectedBytes !== undefined && (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0)) {
@@ -621,8 +657,9 @@ export function saveAudio(bytes: Buffer, mime: string): SavedAttachment {
     throw Object.assign(new Error("unsupported audio type"), { status: 400 });
   }
   if (bytes.byteLength === 0) throw Object.assign(new Error("empty audio"), { status: 400 });
-  if (bytes.byteLength > FILE_MAX_BYTES) {
-    throw Object.assign(new Error(`audio exceeds ${FILE_MAX_BYTES} bytes`), { status: 413 });
+  // Saved from memory and served whole by readAttachment, so held to the preview size, not the streamed store limit.
+  if (bytes.byteLength > PREVIEW_MAX_BYTES) {
+    throw Object.assign(new Error(`audio exceeds ${PREVIEW_MAX_BYTES} bytes`), { status: 413 });
   }
   ensureAttachmentsDir();
   const reservation = new AttachmentReservation();
